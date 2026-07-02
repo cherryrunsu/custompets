@@ -1,0 +1,7801 @@
+-- =====================================================================
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService       = game:GetService("HttpService")
+local RunService        = game:GetService("RunService")
+pcall(function() setthreadidentity(2) end)
+-- =====================================================================
+-- MODULE LOADING
+-- =====================================================================
+local Fsys = require(ReplicatedStorage:WaitForChild("Fsys"))
+local load = Fsys.load
+
+-- Root cause of NeonVFXHelper crash: Fsys runs at high thread identity (6+), and
+-- Roblox blocks user ModuleScript requires from high-identity threads.
+-- Fix: hookfunction on require() and retry any failing Instance require at identity 2.
+-- At identity 2 the restriction lifts and NeonVFXHelper loads for real — animation plays.
+local function _makeStub()
+    local stub
+    stub = setmetatable({}, {
+        __index    = function(_, _k) return function(...) return stub end end,
+        __call     = function(_, ...) return stub end,
+        __newindex = function() end,
+    })
+    return stub
+end
+
+if hookfunction then
+    local _origRequire
+    _origRequire = hookfunction(require, function(module, ...)
+        if typeof(module) ~= "Instance" then
+            return _origRequire(module, ...)
+        end
+        local ok, result = pcall(_origRequire, module, ...)
+        if ok then return result end
+        -- Drop to identity 2 and retry — bypasses the "from RobloxScript" restriction
+        pcall(setthreadidentity, 2)
+        local ok2, result2 = pcall(_origRequire, module, ...)
+        pcall(setthreadidentity, 8)
+        if ok2 then return result2 end
+        return _makeStub()
+    end)
+end
+
+-- Fsys.load hook — with hookfunction: pass through (require hook handles identity).
+-- Without hookfunction: stub out NeonVFXHelper to prevent crash.
+local _origFsysLoad
+if hookfunction then
+    _origFsysLoad = hookfunction(Fsys.load, function(name, ...)
+        return _origFsysLoad(name, ...)
+    end)
+else
+    _origFsysLoad = Fsys.load
+    Fsys.load = function(name, ...)
+        if type(name) == "string" and name:lower():find("neonvfx") then
+            return _makeStub()
+        end
+        return _origFsysLoad(name, ...)
+    end
+end
+load = Fsys.load
+
+-- Pre-warm NeonVFXHelper so it's cached before cave fusion fires
+task.spawn(function()
+    task.wait(1)
+    pcall(setthreadidentity, 2)
+    pcall(_origFsysLoad, "NeonVFXHelper")
+    pcall(setthreadidentity, 8)
+end)
+local UIManager   = load("UIManager")
+local ClientData  = load("ClientData")
+local TableUtil   = load("TableUtil")
+local InventoryDB = load("InventoryDB")
+if UIManager.wait_for_initialization then UIManager:wait_for_initialization() else task.wait(2) end
+local TradeApp        = UIManager.apps.TradeApp
+local BackpackApp     = UIManager.apps.BackpackApp
+local DialogApp       = UIManager.apps.DialogApp
+local HintApp         = UIManager.apps.HintApp
+local TradeHistoryApp = UIManager.apps.TradeHistoryApp
+if not TradeApp then return end
+local NegotiationFrame  = Players.LocalPlayer.PlayerGui.TradeApp.Frame.NegotiationFrame
+local ConfirmationFrame = Players.LocalPlayer.PlayerGui.TradeApp.Frame.ConfirmationFrame
+-- =====================================================================
+-- HIGH TIER PETS
+-- =====================================================================
+local HIGH_TIER_PETS = {
+    "Bat Dragon", "Shadow Dragon", "Giraffe", "Frost Dragon",
+    "Owl", "Parrot", "Balloon Unicorn", "Crow",
+    "African Wild Dog", "Giant Panda", "HaeTae", "Cryptid",
+    "Evil Unicorn", "Blazing Lion", "Hedgehog", "Orchid Butterfly",
+    "Diamond Butterfly", "Dalmatian", "Arctic Reindeer", "Mini Pig",
+    "Jekyll Hydra", "Hot Doggo", "Mermicorn", "Pelican",
+    "Cow", "Strawberry Shortcake Bat Dragon", "Goose",
+    "Chocolate Chip Bat Dragon", "Cabbit", "Turtle",
+    "Peppermint Penguin", "Monkey King", "Undead Jousting Horse",
+    "Flamingo", "Kangaroo",
+}
+
+-- =====================================================================
+-- CONFIG
+-- =====================================================================
+local CONFIG = {
+    PARTNER_NAME               = "Player123",
+    PARTNER_USER_ID            = 0,
+    AUTO_ACCEPT_DELAY          = 2,
+    AUTO_CONFIRM_DELAY         = 1.5,
+    SPECTATOR_COUNT            = 0,
+    AUTO_PARTNER               = true,
+    NEGOTIATION_LOCK           = 5,
+    CONFIRMATION_LOCK_PER_ITEM = 3,
+    FRIEND_PARTNER             = true,
+}
+-- =====================================================================
+-- Forward declarations for pet spawner tables — trade completion references these
+-- before the spawner section initialises them
+local SpawnedPets  = {}
+local SpawnedItems = {}
+
+-- Anti-stack: hook BackpackItemStackHashHelper so every item gets a unique hash
+do
+    local ok, HashHelper = pcall(function()
+        return require(game.ReplicatedStorage:WaitForChild("Fsys")).load("BackpackItemStackHashHelper")
+    end)
+    if ok and HashHelper and HashHelper.get_item_data_hash and not HashHelper._antiStackInstalled then
+        HashHelper._antiStackInstalled = true
+        local _orig = HashHelper.get_item_data_hash
+        HashHelper.get_item_data_hash = function(item_data)
+            if item_data and item_data.unique then
+                return "nostack_" .. item_data.unique
+            end
+            return _orig(item_data)
+        end
+    end
+end
+
+-- MOCK STATE
+-- =====================================================================
+local mockState = {
+    active               = false, trade = nil, isAddingItem = false,
+    partnerActionPending = false, tradeCompleting = false, scamWarningShown = true,
+    originalFunctions = {}, tradeHistory = {}, addedTradeIds = {},
+    blockedTradeRequests = {}, pendingTradeRequest = false, canShowTradeRequest = true,
+    tradeRequestBlocked = false, isMockTradeDialog = false,
+    originalDialogFunction = nil, originalGetTradeHistory = nil, originalReportScam = nil,
+}
+-- =====================================================================
+-- FRIEND HIGHLIGHT
+-- =====================================================================
+local function FriendHighlight(val)
+    pcall(function()
+        NegotiationFrame.FriendHighlight.Visible = val
+        NegotiationFrame.FriendBorder.Visible = val
+        NegotiationFrame.Header.PartnerFrame.NameLabel.FriendLabel.Visible = val
+        local ok, CTM = pcall(load, "ColorThemeManager")
+        if ok and CTM then
+            local color = CTM.lookup(val and "background" or "saturated")
+            NegotiationFrame.Header.PartnerFrame.ProfileIcon.ImageColor3 = color
+            NegotiationFrame.Header.PartnerFrame.NameLabel.TextColor3 = color
+        end
+        NegotiationFrame.Header.PartnerFrame.Icon.Visible = val
+        NegotiationFrame.Header.PartnerFrame.Icon.Image = "rbxassetid://84667805159408"
+        TradeApp.confirmation_partner_icon.Image = val and "rbxassetid://84667805159408" or ""
+        TradeApp.confirmation_partner_icon.Visible = val
+        if mockState.active then NegotiationFrame.Header.PartnerFrame.NameLabel.Text = CONFIG.PARTNER_NAME end
+    end)
+end
+-- =====================================================================
+-- MOCK PARTNER
+-- =====================================================================
+local mockPartner
+local function createMockPartner()
+    mockPartner = setmetatable({
+        Name = CONFIG.PARTNER_NAME, DisplayName = CONFIG.PARTNER_NAME,
+        UserId = CONFIG.PARTNER_USER_ID, ClassName = "Player", AccountAge = 365,
+        MembershipType = Enum.MembershipType.None, Neutral = true,
+        TeamColor = BrickColor.new("White"),
+        CharacterAdded = Instance.new("BindableEvent"),
+        CharacterRemoving = Instance.new("BindableEvent"),
+    }, {
+        __index = function(t, k)
+            if k == "Parent" then return Players end
+            if k == "IsA" then return function(_, c) return c == "Player" or c == "Instance" end end
+            if k == "GetAttribute" then return function() return nil end end
+            if k == "FindFirstChild" then return function() return nil end end
+            if k == "WaitForChild" then return function() return nil end end
+            return rawget(t, k)
+        end,
+        __tostring = function() return CONFIG.PARTNER_NAME end,
+        __eq = function(a, b)
+            if type(b) == "table" then return rawget(a, "UserId") == rawget(b, "UserId") end
+            local ok, uid = pcall(function() return b.UserId end)
+            return ok and uid and rawget(a, "UserId") == uid or false
+        end,
+    })
+    return mockPartner
+end
+createMockPartner()
+local function updatePartnerFromUsername(username)
+    local ok, uid = pcall(function() return Players:GetUserIdFromNameAsync(username) end)
+    if ok and uid then CONFIG.PARTNER_USER_ID = uid; CONFIG.PARTNER_NAME = username; createMockPartner(); return true end
+    return false
+end
+-- =====================================================================
+-- MOCK TRADE FACTORY
+-- =====================================================================
+local function createMockTrade()
+    return {
+        trade_id = "MOCK_" .. tick(), sender = Players.LocalPlayer, recipient = mockPartner,
+        sender_offer = { items = {}, player_name = Players.LocalPlayer.Name, negotiated = false, confirmed = false },
+        recipient_offer = { items = {}, player_name = CONFIG.PARTNER_NAME, negotiated = false, confirmed = false },
+        current_stage = "negotiation", offer_version = 1,
+        sender_has_trade_license = true, recipient_has_trade_license = true,
+        busy_indicators = {}, subscriber_count = CONFIG.SPECTATOR_COUNT,
+    }
+end
+-- =====================================================================
+-- TRADE HISTORY
+-- =====================================================================
+local function createTradeHistoryRecord(trade)
+    return {
+        trade_id = trade.trade_id, timestamp = os.time(),
+        sender_user_id = Players.LocalPlayer.UserId, sender_name = Players.LocalPlayer.Name,
+        sender_items = TableUtil.deep_copy(trade.sender_offer.items),
+        recipient_user_id = trade.recipient.UserId, recipient_name = CONFIG.PARTNER_NAME,
+        recipient_items = TableUtil.deep_copy(trade.recipient_offer.items),
+        reported = false, reverted = nil,
+    }
+end
+local function appendToTradeHistory(record)
+    if mockState.addedTradeIds[record.trade_id] then return end
+    mockState.addedTradeIds[record.trade_id] = true
+    table.insert(mockState.tradeHistory, record)
+end
+local function hookTradeHistoryFunctions()
+    if not TradeHistoryApp then return end
+    if TradeHistoryApp._get_trade_history then mockState.originalGetTradeHistory = TradeHistoryApp._get_trade_history end
+    if TradeHistoryApp.report_scam then mockState.originalReportScam = TradeHistoryApp.report_scam end
+    TradeHistoryApp._get_trade_history = function(self, useCache)
+        local history = mockState.originalGetTradeHistory and mockState.originalGetTradeHistory(self, useCache) or {}
+        local combined, seenIds = {}, {}
+        if history then for _, r in ipairs(history) do if not seenIds[r.trade_id] then table.insert(combined, r); seenIds[r.trade_id] = true end end end
+        for _, r in ipairs(mockState.tradeHistory) do if not seenIds[r.trade_id] then table.insert(combined, r); seenIds[r.trade_id] = true end end
+        self.cached_trade_history = combined
+        return combined
+    end
+    TradeHistoryApp.report_scam = function(self, tradeData)
+        if tradeData and tostring(tradeData.trade_id):find("MOCK_") then
+            self.UIManager.set_app_visibility(self.ClassName, false)
+            local result = self.UIManager.apps.DialogApp:dialog({ dialog_type = "ReportScamDialog", suspect_name = CONFIG.PARTNER_NAME, placeholder_text = "What happened? (Optional)", max_length = 500, use_utf8_length = true, left = "Cancel", right = "Report" })
+            self.UIManager.set_app_visibility(self.ClassName, true)
+            if result == "Report" then
+                for _, r in ipairs(mockState.tradeHistory) do if r.trade_id == tradeData.trade_id then r.reported = true; break end end
+                self.UIManager.apps.DialogApp:dialog({ text = "Report submitted.", button = "Close", yields = false })
+            end
+            if self.instance.Frame.Visible then self:_refresh() else self:_clear_scrolling_frame() end
+            return
+        end
+        if mockState.originalReportScam then return mockState.originalReportScam(self, tradeData) end
+    end
+end
+hookTradeHistoryFunctions()
+-- =====================================================================
+-- BUSY INDICATORS
+-- =====================================================================
+local function update_busy_indicators(val)
+    pcall(function()
+        local partnerUserId = tostring(CONFIG.PARTNER_USER_ID)
+        mockState.trade.busy_indicators[partnerUserId] = val
+        TradeApp.partner_negotiation_offer_pane:display_busy(val)
+    end)
+end
+-- =====================================================================
+-- SELF BADGE IMAGE — module-level so Misc tab can change it
+local BADGE_IMAGE = "rbxassetid://4184878149"
+local SUGGEST_BTN_TEXT = "Suggest" -- changeable from Misc tab
+local BADGE_ICON_ENABLED = true -- toggled by Misc tab badge toggle
+
+-- SELF BADGE
+-- =====================================================================
+do
+
+    local function lockIcon(icon, anchorPoint, position, size)
+        if not icon then return end
+        size = size or 30
+        icon.Image             = BADGE_IMAGE
+        icon.Visible           = BADGE_ICON_ENABLED
+        icon.ImageTransparency = 0
+        icon.ImageColor3       = Color3.new(1,1,1)
+        icon.Size              = UDim2.new(0, size, 0, size)
+        icon.AnchorPoint       = anchorPoint
+        icon.Position          = position
+        -- Re-apply whenever the game resets the image
+        icon:GetPropertyChangedSignal("Image"):Connect(function()
+            if icon.Image ~= BADGE_IMAGE then
+                icon.Image = BADGE_IMAGE
+            end
+        end)
+        icon:GetPropertyChangedSignal("Visible"):Connect(function()
+            if BADGE_ICON_ENABLED and not icon.Visible then icon.Visible = true end
+        end)
+    end
+
+    task.spawn(function()
+        local tradeGui = Players.LocalPlayer.PlayerGui:WaitForChild("TradeApp", 30)
+        if not tradeGui then return end
+
+        local negApplied = false
+        local cfApplied  = false
+
+        while true do
+            task.wait(0.05)
+            if not (mockState and mockState.active) then
+                negApplied = false; cfApplied = false
+                continue
+            end
+
+            if not negApplied then
+                local negIcon = tradeGui.Frame.NegotiationFrame.Header.YouFrame:FindFirstChild("Icon")
+                if negIcon then
+                    lockIcon(negIcon, Vector2.new(0, 0.5), UDim2.new(0, 0, 0.5, -2))
+                    negApplied = true
+                end
+            end
+
+            if not cfApplied and tradeGui.Frame.ConfirmationFrame.Visible then
+                local cfIcon = tradeGui.Frame.ConfirmationFrame:FindFirstChild("YouIcon")
+                if cfIcon then
+                    -- Confirmation frame uses TagScale 0.6896 vs negotiation 1.0
+                    -- so icon should be ~69% of negotiation size: 30 * 0.6896 ≈ 21px
+                    lockIcon(cfIcon, cfIcon.AnchorPoint, cfIcon.Position, 21)
+                    cfApplied = true
+                end
+            end
+        end
+    end)
+end
+-- =====================================================================
+-- REACTIONS — exact reference implementation using Spring + CloudValues + _initialize_spectate hook
+-- =====================================================================
+local _EmojiSpring = nil
+pcall(function() _EmojiSpring = load("Spring") end)
+local _emojiReactionFrame = nil
+local _emojiReactions = {}
+pcall(function()
+    _emojiReactions = require(ReplicatedStorage.ClientModules.CloudValues):getValue("player_chat", "trade_spectate_reactions") or {}
+end)
+-- Hook _initialize_spectate to capture ReactionFrame after it's wired up
+do
+    local origInit = TradeApp._initialize_spectate
+    if origInit then
+        TradeApp._initialize_spectate = function(self, ...)
+            local r = origInit(self, ...)
+            pcall(function()
+                if self.spectate_frame then
+                    _emojiReactionFrame = self.spectate_frame:FindFirstChild("ReactionFrame")
+                end
+            end)
+            return r
+        end
+    end
+end
+local function _spawnReaction(imageId)
+    local rf = _emojiReactionFrame
+    if not rf and TradeApp.spectate_frame then rf = TradeApp.spectate_frame:FindFirstChild("ReactionFrame") end
+    if not rf then
+        local tradeGui = Players.LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+        if tradeGui then
+            for _, desc in ipairs(tradeGui:GetDescendants()) do
+                if desc.Name == "ReactionFrame" and desc:IsA("Frame") then rf = desc; break end
+            end
+        end
+    end
+    if not rf then return end
+    local tmpl = rf:FindFirstChild("ReactionTemplate")
+    local emoji
+    if tmpl then
+        emoji = tmpl:Clone()
+    else
+        emoji = Instance.new("ImageLabel")
+        emoji.Name = "ReactionTemplate"; emoji.BackgroundTransparency = 1; emoji.AnchorPoint = Vector2.new(0.5, 0.5)
+    end
+    emoji.Image = imageId; emoji.Parent = rf; emoji.ImageTransparency = 1; emoji.Size = UDim2.fromScale(0, 0)
+    TweenService:Create(emoji, TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+        ImageTransparency = 0, Size = UDim2.fromOffset(48, 48)
+    }):Play()
+    local rng = Random.new()
+    local totalDur  = rng:NextNumber(2, 3.5)
+    local vertSpeed = rng:NextNumber(0.23, 0.29)
+    local fadeStart = totalDur * rng:NextNumber(0.65, 0.8)
+    local xPos  = rng:NextNumber(0.35, 0.45)
+    local xGoal = rng:NextNumber(0.1, 0.9)
+    local spring = _EmojiSpring and _EmojiSpring.new(xPos, rng:NextNumber(1.1, 1.25), -0.5) or nil
+    if spring then spring:set_goal(xGoal) end
+    emoji.Position = UDim2.fromScale(-0.5, 1.0)
+    local startTick = tick()
+    local c
+    c = RunService.Heartbeat:Connect(function(dt)
+        local elapsed = tick() - startTick
+        if elapsed >= totalDur or not emoji.Parent then
+            c:Disconnect(); if emoji and emoji.Parent then emoji:Destroy() end; return
+        end
+        local newY = emoji.Position.Y.Scale - vertSpeed * dt
+        local newX
+        if spring then spring:update(dt); newX = spring:get_position()
+        else xPos = xPos + (xGoal - xPos) * dt * 1.5; newX = xPos end
+        emoji.Position = UDim2.fromScale(newX, newY)
+        if elapsed >= fadeStart then emoji.ImageTransparency = (elapsed - fadeStart) / (totalDur - fadeStart) end
+    end)
+end
+local reactionLoop = nil
+local function startReactionLoop()
+    if reactionLoop then return end
+    if #_emojiReactions == 0 then return end
+    reactionLoop = task.spawn(function()
+        while mockState.active do
+            task.wait(math.random(8, 20) / 10)
+            if mockState.active and mockState.trade and #_emojiReactions > 0 then
+                pcall(_spawnReaction, _emojiReactions[math.random(1, #_emojiReactions)])
+            end
+        end
+        reactionLoop = nil
+    end)
+end
+local function stopReactionLoop()
+    if reactionLoop then task.cancel(reactionLoop); reactionLoop = nil end
+end
+-- =====================================================================
+-- ADD PET TO PARTNER OFFER
+-- =====================================================================
+local function generateRandomFlags()
+    -- Pick a random tier: normal, fly, ride, fly+ride, neon fr, mega neon fr
+    local roll = math.random(1, 10)
+    if roll <= 2 then
+        -- Normal (no potions)
+        return { F = false, R = false, N = false, M = false }
+    elseif roll <= 4 then
+        -- Fly only
+        return { F = true, R = false, N = false, M = false }
+    elseif roll <= 6 then
+        -- Fly + Ride
+        return { F = true, R = true, N = false, M = false }
+    elseif roll <= 8 then
+        -- Neon FR
+        return { F = true, R = true, N = true, M = false }
+    else
+        -- Mega Neon FR
+        return { F = true, R = true, N = false, M = true }
+    end
+end
+
+local function getRandomAge(flags)
+    -- Ages in Adopt Me: 1=Newborn, 2=Junior, 3=Pre-Teen, 4=Teen, 5=Post-Teen, 6=Full Grown
+    -- Neon/Mega pets start fresh so more likely to be lower age
+    -- Normal pets can be any age, weighted toward full grown for high tiers
+    if flags.M or flags.N then
+        -- Neon/Mega more likely newborn-teen range
+        local ages = {1, 1, 2, 2, 3, 4, 5, 6}
+        return ages[math.random(1, #ages)]
+    else
+        -- Normal/FR weighted toward full grown
+        local ages = {1, 2, 3, 4, 5, 6, 6, 6}
+        return ages[math.random(1, #ages)]
+    end
+end
+
+local function addPetToPartnerOffer(petName, flags)
+    if not mockState.active or not mockState.trade then return false end
+    if mockState.trade.current_stage == "confirmation" then return false end
+    if #mockState.trade.recipient_offer.items >= 18 then return false end
+    update_busy_indicators({ picking = true })
+    task.wait(0.5)
+    if not mockState.active or not mockState.trade then update_busy_indicators({ picking = false }); return false end
+
+    -- Generate random flags if not provided
+    local petFlags = flags or generateRandomFlags()
+    local age = getRandomAge(petFlags)
+
+    for catName, catTable in pairs(InventoryDB) do
+        if catName == "pets" then
+            for id, item in pairs(catTable) do
+                if item.name == petName then
+                    local petItem = {
+                        category = "pets",
+                        kind = id,
+                        unique = HttpService:GenerateGUID(),
+                        properties = {
+                            flyable   = petFlags.F,
+                            rideable  = petFlags.R,
+                            neon      = petFlags.N,
+                            mega_neon = petFlags.M,
+                            age       = age,
+                        }
+                    }
+                    table.insert(mockState.trade.recipient_offer.items, petItem)
+                    mockState.trade.sender_offer.negotiated = false; mockState.trade.recipient_offer.negotiated = false
+                    if mockState.trade.current_stage == "confirmation" then
+                        mockState.trade.current_stage = "negotiation"
+                        mockState.trade.sender_offer.confirmed = false; mockState.trade.recipient_offer.confirmed = false
+                    end
+                    mockState.trade.offer_version = mockState.trade.offer_version + 1
+                    TradeApp:_overwrite_local_trade_state(mockState.trade)
+                    pcall(function() if TradeApp._lock_trade_for_appropriate_time then TradeApp:_lock_trade_for_appropriate_time() end end)
+                    pcall(function() if TradeApp._render_message_in_trade_chat then TradeApp:_render_message_in_trade_chat(nil, CONFIG.PARTNER_NAME .. " added " .. petName .. ".", true) end end)
+                    update_busy_indicators({ picking = false }); return true
+                end
+            end
+        end
+    end
+    update_busy_indicators({ picking = false }); return false
+end
+-- =====================================================================
+-- STORE ORIGINALS
+-- =====================================================================
+local function storeOriginals()
+    local names = { "_get_local_trade_state", "_overwrite_local_trade_state", "_change_local_trade_state",
+        "_get_my_offer", "_get_partner_offer", "_get_my_player", "_get_partner", "_get_current_trade_stage",
+        "_on_accept_pressed", "_on_confirm_pressed", "_on_unaccept_pressed", "_decline_trade",
+        "_add_item_to_my_offer", "_remove_item_from_my_offer", "_lock_trade_for_appropriate_time",
+        "_get_lock_time", "refresh_all", "_evaluate_trade_fairness" }
+    for _, n in ipairs(names) do if TradeApp[n] then mockState.originalFunctions[n] = TradeApp[n] end end
+end
+storeOriginals()
+-- =====================================================================
+-- PARTNER AUTO ACTION
+-- =====================================================================
+-- Hook trade request event to block incoming requests while in mock trade (from reference)
+local RouterClient = load("RouterClient")
+local function sendTradeRequest(targetPlayer)
+    if not targetPlayer or not targetPlayer:IsA("Player") then return end
+    local SendTradeRequest = RouterClient.get("TradeAPI/SendTradeRequest")
+    if SendTradeRequest then
+        pcall(function() SendTradeRequest:FireServer(targetPlayer) end)
+    end
+end
+local showBlockedTradeRequests = function() mockState.blockedTradeRequests = {} end
+local function hookTradeRequestEvent()
+    local tradeRequestEvent = RouterClient.get_event("TradeAPI/TradeRequestReceived")
+    if tradeRequestEvent then
+        local originalConnections = getconnections(tradeRequestEvent.OnClientEvent)
+        for _, connection in pairs(originalConnections) do connection:Disable() end
+        tradeRequestEvent.OnClientEvent:Connect(function(requestingPlayer)
+            if mockState.active or mockState.tradeRequestBlocked then
+                pcall(function()
+                    RouterClient.get("TradeAPI/AcceptOrDeclineTradeRequest"):InvokeServer(requestingPlayer, false)
+                end)
+                table.insert(mockState.blockedTradeRequests, { player = requestingPlayer, timestamp = tick() })
+                return
+            end
+            for _, connection in pairs(originalConnections) do
+                if connection.Function then connection.Function(requestingPlayer) end
+            end
+        end)
+    end
+end
+hookTradeRequestEvent()
+
+-- =====================================================================
+-- BACKPACK SUGGESTION SYSTEM (from reference)
+-- =====================================================================
+local function GetPlayerCollectionPetsByUserId(userId)
+    local profileItems = { pets = {}, error = nil }
+    local player = Players:GetPlayerByUserId(userId)
+    local playerProfileData = nil
+    if player then
+        local ok = pcall(function()
+            playerProfileData = ClientData.get_server(player, "player_profile") or {}
+        end)
+        if not ok then playerProfileData = {} end
+    else
+        local GetProfile = load("RouterClient").get("PlayerProfileAPI/FetchProfile")
+        local profileData = nil
+        local timeoutDone = false
+        task.spawn(function()
+            local ok, result = pcall(function() return GetProfile:InvokeServer(userId) end)
+            if not timeoutDone then profileData = (ok and result) or {}; playerProfileData = profileData end
+        end)
+        local startTime = os.clock()
+        while profileData == nil and os.clock() - startTime < 3 do task.wait(0.05) end
+        if profileData == nil then timeoutDone = true; playerProfileData = {} end
+    end
+    if playerProfileData and type(playerProfileData) == "table" then
+        local norm = playerProfileData
+        if playerProfileData.profile then norm = playerProfileData.profile
+        elseif playerProfileData.data then norm = playerProfileData.data end
+        if norm.pages and type(norm.pages) == "table" then
+            for _, page in ipairs(norm.pages) do
+                if page and page.widgets then
+                    for _, widget in ipairs(page.widgets) do
+                        if widget and widget.data then
+                            local wd = widget.data
+                            if wd.widget_kind == "collection" then
+                                local cd = wd.widget_data
+                                if cd and cd.items and type(cd.items) == "table" then
+                                    for _, item in ipairs(cd.items) do
+                                        if item and item.kind then table.insert(profileItems.pets, item) end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return profileItems
+end
+
+local function GetPlayerCollectionPets(playerOrUserId)
+    local userId = nil
+    if type(playerOrUserId) == "number" then userId = playerOrUserId
+    elseif playerOrUserId and playerOrUserId:IsA("Player") then userId = playerOrUserId.UserId
+    else return { pets = {}, error = "Invalid player" } end
+    return GetPlayerCollectionPetsByUserId(userId)
+end
+
+local suggestInventoryCache = {}
+local lastSuggestTradeId = nil
+
+-- =====================================================================
+-- ELVEBREDD VALUE LOOKUP (module-level so players tab + misc can use it)
+-- =====================================================================
+
+-- =====================================================================
+-- PLAYER NAME APP ROLE INTEGRATION
+-- =====================================================================
+local PLAYER_NAME_TAGS = {
+    founder    = { icon="rbxassetid://5269331469", text_color=Color3.fromRGB(221,153,255), text_stroke_color=Color3.fromRGB(61,38,81)    },
+    developer  = { icon="rbxassetid://5269331469", text_color=Color3.fromRGB(221,153,255), text_stroke_color=Color3.fromRGB(61,38,81)    },
+    staff      = { icon="rbxassetid://5269331469", text_color=Color3.fromRGB(221,153,255), text_stroke_color=Color3.fromRGB(61,38,81)    },
+    influencer = { icon="rbxassetid://5269331158", text_color=Color3.fromRGB(255,0,0),     text_stroke_color=Color3.fromRGB(255,255,255) },
+    vip        = { icon="rbxassetid://18536111292",text_color=Color3.fromRGB(255,170,0),   text_stroke_color=Color3.fromRGB(240,36,0)    },
+}
+local _roleCache = {}
+local function getPlayerRole(userId)
+    if _roleCache[userId] ~= nil then return _roleCache[userId] end
+    _roleCache[userId] = false
+    pcall(function()
+        local PNA = UIManager and UIManager.apps and UIManager.apps.PlayerNameApp
+        if not PNA then return end
+        for _, m in ipairs({"get_role","get_npc_role","get_player_role"}) do
+            if PNA[m] then
+                local ok, r = pcall(function() return PNA[m](PNA, userId) end)
+                if ok and r and type(r)=="string" and PLAYER_NAME_TAGS[r:lower()] then
+                    _roleCache[userId] = r:lower(); return
+                end
+            end
+        end
+    end)
+    return _roleCache[userId]
+end
+local function decorateNameLabel(nameLabel, playerName, userId)
+    task.spawn(function()
+        local role = getPlayerRole(userId)
+        if not role or not PLAYER_NAME_TAGS[role] then return end
+        local td = PLAYER_NAME_TAGS[role]
+        local hex = string.format("#%02x%02x%02x", math.floor(td.text_color.R*255), math.floor(td.text_color.G*255), math.floor(td.text_color.B*255))
+        local shex = string.format("#%02x%02x%02x", math.floor(td.text_stroke_color.R*255), math.floor(td.text_stroke_color.G*255), math.floor(td.text_stroke_color.B*255))
+        if nameLabel and nameLabel.Parent then
+            local base = nameLabel.Text:gsub('<image[^>]*></image>%s*',''):match('^(.-)%s+<font.*$') or nameLabel.Text:gsub('<image[^>]*></image>%s*','')
+            local suf  = nameLabel.Text:match('%s+(<font color="#64dc64".*)$') or ""
+            nameLabel.Text = '<image id="'..td.icon..'" width="1em" height="1em"></image> <font color="'..hex..'" stroke="'..shex..'">'..base..'</font>'..suf
+        end
+    end)
+end
+local ELVE_PETS = {}
+local elveLoaded = false
+task.spawn(function()
+    pcall(function()
+        local body
+        local ok, res = pcall(function()
+            return request({ Url = "https://elvebredd-uh.vercel.app/api/pets", Method = "GET" })
+        end)
+        if ok and res then body = res.Body or res.body end
+        if not body then
+            local ok2, b = pcall(function() return game:HttpGet("https://elvebredd-uh.vercel.app/api/pets") end)
+            if ok2 then body = b end
+        end
+        if not body then return end
+        local ok3, arr = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+        if not ok3 or type(arr) ~= "table" then return end
+        for _, p in ipairs(arr) do
+            if p.name then ELVE_PETS[p.name:lower()] = p end
+        end
+        elveLoaded = true
+    end)
+end)
+
+local function getElveValue(itemName, flags)
+    if not elveLoaded then return nil end
+    local name = itemName:lower()
+    local data = ELVE_PETS[name]
+    if not data then
+        for k, v in pairs(ELVE_PETS) do
+            if k:find(name, 1, true) then data = v; break end
+        end
+    end
+    if not data then return nil end
+    local isMega = flags and (flags.mega_neon or flags.M) or false
+    local isNeon = flags and (flags.neon or flags.N) or false
+    local isFly  = flags and (flags.flyable or flags.F) or false
+    local isRide = flags and (flags.rideable or flags.R) or false
+    local prefix = isMega and "mvalue" or isNeon and "nvalue" or "rvalue"
+    local potion = isFly and isRide and "fly&ride" or isFly and "fly" or isRide and "ride" or "nopotion"
+    return tonumber(data[prefix .. " - " .. potion]) or nil
+end
+
+local function calcCollectionValue(collectionPets)
+    local total = 0
+    for _, pet in ipairs(collectionPets) do
+        if pet.kind then
+            local kd = InventoryDB.pets and InventoryDB.pets[pet.kind]
+            local name = kd and kd.name or pet.kind
+            local v = getElveValue(name, pet.properties)
+            if v then total = total + v end
+        end
+    end
+    return total
+end
+
+local function hookSuggestInventorySystem()
+    task.spawn(function()
+        task.wait(2)
+        pcall(function()
+            if not TradeApp then return end
+            if not TradeApp._original_try_suggest_item then
+                TradeApp._original_try_suggest_item = TradeApp.try_suggest_item
+            end
+            if not TradeApp._original_suggest_item then
+                TradeApp._original_suggest_item = TradeApp.suggest_item
+            end
+
+            TradeApp.try_suggest_item = function(self)
+                if not mockState.active or not mockState.trade then
+                    return self._original_try_suggest_item(self)
+                end
+                local currentTradeId = mockState.trade.trade_id
+                if lastSuggestTradeId ~= currentTradeId then
+                    suggestInventoryCache = {}; lastSuggestTradeId = currentTradeId
+                end
+                if suggestInventoryCache[currentTradeId] then
+                    self.backpack_access = true
+                    local BackpackApp = self.UIManager.apps.BackpackApp
+                    if BackpackApp then
+                        local origGet = ClientData.get
+                        ClientData.get = function(key)
+                            if key == "trade_partner_inventory" then return suggestInventoryCache[currentTradeId] end
+                            return origGet(key)
+                        end
+                        self:suggest_item()
+                        task.spawn(function()
+                            while self.UIManager.is_visible("BackpackApp") do task.wait(0.2) end
+                            ClientData.get = origGet
+                        end)
+                    end
+                    return
+                end
+                local partner = self:_get_partner()
+                if not partner then return end
+                if HintApp then HintApp:hint({ text = "Backpack access requested..", length = 3, overridable = true, yields = false }) end
+                task.wait(0.5)
+                local collectionData = GetPlayerCollectionPets(partner.UserId)
+                local hasPets = collectionData.pets and #collectionData.pets > 0
+                if DialogApp then
+                    local dialogText = hasPets
+                        and (("%s has granted you access to view their backpack! Make a boost now?"):format(partner.Name))
+                        or (("%s has granted you access to view their backpack!"):format(partner.Name))
+                    local response = DialogApp:dialog({ text = dialogText, left = "Cancel", right = hasPets and SUGGEST_BTN_TEXT or "Okay" })
+                    if response == "Cancel" or response == "Okay" then
+                        self.backpack_access = true
+                        suggestInventoryCache[currentTradeId] = { pets={}, toys={}, food={}, gifts={}, roleplay={}, stickers={}, strollers={}, transport={}, pet_accessories={} }
+                        return
+                    end
+                end
+                if not hasPets then self.backpack_access = true; return end
+                local overrideInventory = { pets={}, toys={}, food={}, gifts={}, roleplay={}, stickers={}, strollers={}, transport={}, pet_accessories={} }
+                local rarityBases = { legendary=900000, ultra_rare=700000, rare=500000, uncommon=300000, common=100000 }
+                local rarityCounts = { legendary=0, ultra_rare=0, rare=0, uncommon=0, common=0 }
+                for idx, pet in ipairs(collectionData.pets) do
+                    if pet and pet.kind then
+                        local petKey = (pet.unique and pet.unique ~= "") and pet.unique or ("suggest_"..pet.kind.."_"..idx)
+                        local invPet = InventoryDB.pets and InventoryDB.pets[pet.kind]
+                        if invPet and not overrideInventory.pets[petKey] then
+                            local rarity = invPet.rarity or "common"
+                            local base = rarityBases[rarity] or 100000
+                            rarityCounts[rarity] = (rarityCounts[rarity] or 0) + 1
+                            overrideInventory.pets[petKey] = {
+                                kind=pet.kind, id=pet.kind, category="pets", unique=petKey,
+                                typechecked=true, newness_order=base+99999-rarityCounts[rarity],
+                                name=invPet.name or pet.kind,
+                                properties = {
+                                    age = (pet.properties and tonumber(pet.properties.age)) or 1,
+                                    pet_trick_level = (pet.properties and tonumber(pet.properties.pet_trick_level)) or 0,
+                                    neon = (pet.properties and pet.properties.neon) or false,
+                                    mega_neon = (pet.properties and pet.properties.mega_neon) or false,
+                                    rideable = (pet.properties and pet.properties.rideable) or false,
+                                    flyable = (pet.properties and pet.properties.flyable) or false,
+                                    rp_name = (pet.properties and pet.properties.rp_name) or "",
+                                }
+                            }
+                            if pet.properties then
+                                for k, v in pairs(pet.properties) do
+                                    if overrideInventory.pets[petKey].properties[k] == nil then
+                                        overrideInventory.pets[petKey].properties[k] = v
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                suggestInventoryCache[currentTradeId] = overrideInventory
+                self.backpack_access = true
+                local BackpackApp = self.UIManager.apps.BackpackApp
+                if not BackpackApp then return end
+                local origGet = ClientData.get
+                ClientData.get = function(key)
+                    if key == "trade_partner_inventory" then return overrideInventory end
+                    return origGet(key)
+                end
+                self:suggest_item()
+                task.spawn(function()
+                    while self.UIManager.is_visible("BackpackApp") do task.wait(0.2) end
+                    ClientData.get = origGet
+                end)
+            end
+
+            TradeApp.suggest_item = function(self, specific_item)
+                if not mockState.active or not mockState.trade then
+                    return self._original_suggest_item(self, specific_item)
+                end
+                local BackpackApp = self.UIManager.apps.BackpackApp
+                if BackpackApp:is_picking_item() then return end
+                local suggestible = self:_get_suggestible_items() or {}
+                local myPlayer = self:_get_my_player()
+                local picked = specific_item or BackpackApp:pick_item({
+                    friendship_hidden = true,
+                    title_override = (("%s'S BACKPACK"):format(self:_get_partner().Name:upper())),
+                    inventory_override = suggestible,
+                    force_no_filters = true,
+                    allow_callback = function(item)
+                        local s = self.suggestions[item.unique]
+                        return (not s or s.item_owner == myPlayer) and true or false
+                    end
+                })
+                if not picked then return false end
+                if self.suggestions[picked.unique] then
+                    if HintApp then HintApp:hint({ text = "Item already " .. SUGGEST_BTN_TEXT:lower() .. "d!", length = 3, overridable = true, yields = false }) end
+                    return false
+                end
+                for _, offered in self:_get_partner_offer().items do
+                    if offered.unique == picked.unique then
+                        if HintApp then HintApp:hint({ text = "Item already added to offer!", length = 4, overridable = true, yields = false }) end
+                        return false
+                    end
+                end
+                local petName = picked.kind
+                if picked.category == "pets" and InventoryDB.pets and InventoryDB.pets[picked.kind] then
+                    petName = InventoryDB.pets[picked.kind].name or picked.kind
+                end
+                local partner = (mockState.active and mockState.trade and mockState.trade.recipient) or self:_get_partner()
+                if not TradeApp.suggestions then TradeApp.suggestions = {} end
+                -- Don't pre-register — let _render_suggestion create the instance itself
+                -- Just ensure the entry doesn't exist so _render_suggestion doesn't skip
+                TradeApp.suggestions[picked.unique] = nil
+                pcall(function() self:_render_suggestion(picked.unique, partner) end)
+                task.spawn(function()
+                    task.wait(math.random(15, 30) / 10)
+                    pcall(function() self:_render_suggestion_finalized(picked.unique, true, Players.LocalPlayer) end)
+                    task.wait(math.random(5, 12) / 10)
+                    addPetToPartnerOffer(petName, {
+                        F = picked.properties and picked.properties.flyable or false,
+                        R = picked.properties and picked.properties.rideable or false,
+                        N = picked.properties and picked.properties.neon or false,
+                        M = picked.properties and picked.properties.mega_neon or false,
+                    })
+                end)
+                return true
+            end
+
+            -- Clear cache on trade end
+            task.spawn(function()
+                task.wait(2.5)
+                pcall(function()
+                    local origDecline = mockState.originalFunctions and mockState.originalFunctions._decline_trade
+                    if origDecline then
+                        TradeApp._decline_trade = function(self, silent)
+                            if mockState.active and mockState.trade then
+                                suggestInventoryCache[mockState.trade.trade_id] = nil
+                                lastSuggestTradeId = nil
+                            end
+                            return origDecline(self, silent)
+                        end
+                    end
+                end)
+            end)
+        end)
+    end)
+end
+hookSuggestInventorySystem()
+
+-- =====================================================================
+-- SUGGEST TO REMOVE
+-- The real TradeApp slot callback already shows the red X and fires
+-- TradeAPI/SuggestRemoveItem when can_suggest_removal_items[unique] exists.
+-- We just need to: 1) populate can_suggest_removal_items when partner adds items
+--                  2) handle the SuggestRemoveItem remote client-side
+-- =====================================================================
+do
+    -- 1) Populate can_suggest_removal_items whenever partner offer changes
+    local function syncRemovalItems()
+        if not mockState.active or not mockState.trade then return end
+        if not TradeApp.can_suggest_removal_items then TradeApp.can_suggest_removal_items = {} end
+        -- Clear then repopulate from current recipient offer
+        for k in pairs(TradeApp.can_suggest_removal_items) do
+            TradeApp.can_suggest_removal_items[k] = nil
+        end
+        for _, item in ipairs(mockState.trade.recipient_offer.items or {}) do
+            if item and item.unique then
+                TradeApp.can_suggest_removal_items[item.unique] = item
+            end
+        end
+    end
+
+    -- Hook refresh_all to sync after every state update
+    local origRefreshAll = TradeApp.refresh_all
+    TradeApp.refresh_all = function(self, ...)
+        if mockState._blockRefreshAll then return end
+        local r = origRefreshAll(self, ...)
+        pcall(syncRemovalItems)
+        return r
+    end
+
+    -- 2) Hook TradeAPI/SuggestRemoveItem via __namecall on the RemoteEvent
+    local suggestRemoveEvent = load("RouterClient").get_event("TradeAPI/SuggestRemoveItem")
+    if suggestRemoveEvent then
+        local mt = getrawmetatable(suggestRemoveEvent)
+        if mt then
+            local oldNamecall = mt.__namecall
+            pcall(setreadonly, mt, false)
+            mt.__namecall = function(self, ...)
+                if self == suggestRemoveEvent and getnamecallmethod() == "FireServer" then
+                    local uniqueId = select(1, ...)
+                    if mockState.active and mockState.trade then
+                        -- Chat message immediately
+                        pcall(function()
+                            local item = TradeApp.can_suggest_removal_items and TradeApp.can_suggest_removal_items[uniqueId]
+                            local petName = item and ((InventoryDB.pets and InventoryDB.pets[item.kind] and InventoryDB.pets[item.kind].name) or item.kind) or "item"
+                            TradeApp:_render_message_in_trade_chat(nil, "You want " .. CONFIG.PARTNER_NAME .. " to remove " .. petName .. " from their offer", false)
+                        end)
+                        -- Partner removes after 0.6s
+                        task.spawn(function()
+                            task.wait(0.6)
+                            if not mockState.active or not mockState.trade then return end
+                            for i, item in ipairs(mockState.trade.recipient_offer.items) do
+                                if item.unique == uniqueId then
+                                    table.remove(mockState.trade.recipient_offer.items, i)
+                                    mockState.trade.recipient_offer.negotiated = false
+                                    mockState.trade.sender_offer.negotiated = false
+                                    if mockState.trade.current_stage == "confirmation" then
+                                        mockState.trade.current_stage = "negotiation"
+                                        mockState.trade.sender_offer.confirmed = false
+                                        mockState.trade.recipient_offer.confirmed = false
+                                    end
+                                    mockState.trade.offer_version = mockState.trade.offer_version + 1
+                                    TradeApp:_overwrite_local_trade_state(mockState.trade)
+                                    pcall(function() TradeApp:_lock_trade_for_appropriate_time() end)
+                                    local petName2 = (InventoryDB.pets and InventoryDB.pets[item.kind] and InventoryDB.pets[item.kind].name) or item.kind
+                                    pcall(function() TradeApp:_render_message_in_trade_chat(nil, CONFIG.PARTNER_NAME .. " removed " .. petName2 .. ".", true) end)
+                                    break
+                                end
+                            end
+                        end)
+                        return
+                    end
+                end
+                return oldNamecall(self, ...)
+            end
+            pcall(setreadonly, mt, true)
+        end
+    end
+end
+-- =====================================================================
+do
+    local PlayerProfileApp = UIManager.apps.PlayerProfileApp
+    if PlayerProfileApp and PlayerProfileApp.open_player_profile_for_user_id then
+        local origOpen = PlayerProfileApp.open_player_profile_for_user_id
+        PlayerProfileApp.open_player_profile_for_user_id = function(self, userId)
+            local result = origOpen(self, userId)
+            if mockState.active and mockState.trade and self.player_profile then
+                local partnerId = mockState.trade.recipient.UserId
+                if userId == partnerId and not self.player_profile.player then
+                    self.player_profile.player = mockState.trade.recipient
+                end
+            end
+            if mockState.active and mockState.trade then
+                -- Poll continuously while profile is open — overwrite any Trade/Boost button
+                task.spawn(function()
+                    while UIManager.is_visible("PlayerProfileApp") do
+                        task.wait(0.08)
+                        pcall(function()
+                            local pGui = Players.LocalPlayer.PlayerGui:FindFirstChild("PlayerProfileApp")
+                            if not pGui then return end
+                            for _, desc in ipairs(pGui:GetDescendants()) do
+                                if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and
+                                   (desc.Text == "Trade" or desc.Text == "Boost" or desc.Text == "Suggest") then
+                                    desc.Text = SUGGEST_BTN_TEXT
+                                end
+                            end
+                        end)
+                    end
+                end)
+            end
+            return result
+        end
+    end
+end
+
+-- Profile suggest dialog hook — intercepts "Add boost for X" dialog and auto-adds to offer
+do
+    local origDialog = DialogApp and DialogApp.dialog
+    if origDialog then
+        DialogApp.dialog = function(self, dialogData, ...)
+            if mockState.active and dialogData and dialogData.dialog_type == "ItemPreviewDialog" and dialogData.item and dialogData.text then
+                print("[profile suggest] dialog text:", dialogData.text)
+                local isSuggestDialog = dialogData.text:lower():find("add .+ for")
+                if isSuggestDialog then
+                    local item = dialogData.item
+                    local petDisplayName = item.kind
+                    if item.category == "pets" and InventoryDB.pets and InventoryDB.pets[item.kind] then
+                        petDisplayName = InventoryDB.pets[item.kind].name or item.kind
+                    end
+                    local result = origDialog(self, dialogData, ...)
+                    if result ~= "Cancel" then
+                        pcall(function() UIManager.set_app_visibility("PlayerProfileApp", false) end)
+
+                        -- Write item into suggestInventoryCache + trade_partner_inventory
+                        -- so TradeApp.suggest_item can find it via _get_suggestible_items()
+                        local tradeId = mockState.trade and mockState.trade.trade_id
+                        if tradeId then
+                            suggestInventoryCache[tradeId] = suggestInventoryCache[tradeId] or { pets={}, toys={}, food={}, gifts={}, roleplay={}, stickers={}, strollers={}, transport={}, pet_accessories={} }
+                            suggestInventoryCache[tradeId].pets[item.unique] = item
+                        end
+                        pcall(function()
+                            local raw = ClientData.get_data and ClientData.get_data()
+                            if raw and raw[Players.LocalPlayer.Name] then
+                                local tpi = raw[Players.LocalPlayer.Name]["trade_partner_inventory"] or {}
+                                tpi.pets = tpi.pets or {}
+                                tpi.pets[item.unique] = item
+                                raw[Players.LocalPlayer.Name]["trade_partner_inventory"] = tpi
+                            end
+                        end)
+
+                        -- Use the exact same path as backpack suggestion — call suggest_item(TradeApp, item)
+                        -- This goes through our hooked suggest_item which calls _render_suggestion(picked.unique, _get_partner())
+                        -- and that works because _get_partner() returns mockPartner which is what was stored
+                        task.spawn(function()
+                            TradeApp.suggest_item(TradeApp, item)
+                        end)
+                        mockState._profileSuggestHandled = true
+                        task.spawn(function() task.wait(0.5); mockState._profileSuggestHandled = false end)
+                    end
+                    return "Cancel"
+                end
+            end
+            return origDialog(self, dialogData, ...)
+        end
+    end
+end
+local function partnerAutoAction()
+    if not mockState.active or not mockState.trade or mockState.partnerActionPending then return end
+    mockState.partnerActionPending = true
+    while TradeApp.lock_countdown and TradeApp.lock_countdown.is_going and TradeApp.lock_countdown:is_going() do task.wait(0.1) end    if mockState.trade and mockState.trade.current_stage == "negotiation" then
+        task.wait(CONFIG.AUTO_ACCEPT_DELAY)
+        if mockState.active and mockState.trade then
+            mockState.trade.recipient_offer.negotiated = true
+            if mockState.trade.sender_offer.negotiated then
+                mockState.trade.current_stage = "confirmation"; mockState.trade.offer_version = mockState.trade.offer_version + 1
+                TradeApp:_overwrite_local_trade_state(mockState.trade)
+                pcall(function() if TradeApp._evaluate_trade_fairness then TradeApp:_evaluate_trade_fairness() end end)
+                pcall(function() if TradeApp._lock_trade_for_appropriate_time then TradeApp:_lock_trade_for_appropriate_time() end end)
+                task.delay(0.3, function() pcall(function() FriendHighlight(true) end) end)
+            else
+                mockState.trade.offer_version = mockState.trade.offer_version + 1; TradeApp:_overwrite_local_trade_state(mockState.trade)
+            end
+        end
+    elseif mockState.trade and mockState.trade.current_stage == "confirmation" then
+        task.wait(CONFIG.AUTO_CONFIRM_DELAY)
+        if mockState.active and mockState.trade then
+            mockState.trade.recipient_offer.confirmed = true; mockState.trade.offer_version = mockState.trade.offer_version + 1
+            TradeApp:_overwrite_local_trade_state(mockState.trade)
+            if mockState.trade.sender_offer.confirmed and not mockState.tradeCompleting then
+                mockState.tradeCompleting = true
+                pcall(function()
+                    if TradeApp._set_confirmation_arrow_rotating then
+                        TradeApp:_set_confirmation_arrow_rotating(true)
+                    else
+                        -- Fallback: rotate directly
+                        local cf = Players.LocalPlayer.PlayerGui.TradeApp.Frame.ConfirmationFrame
+                        RunService.Heartbeat:Connect(function(dt)
+                            if not mockState.tradeCompleting then return end
+                            cf.TradeIcon.Rotation = cf.TradeIcon.Rotation + 220 * dt
+                        end)
+                    end
+                end)
+                task.wait(3)
+                local record = createTradeHistoryRecord(mockState.trade)
+                appendToTradeHistory(record)
+                -- Capture items before state clears
+                local receivedItems = {}
+                local sentItems = {}
+                for _, item in ipairs(mockState.trade.recipient_offer.items) do
+                    table.insert(receivedItems, { kind = item.kind or item.id, properties = table.clone(item.properties or {}) })
+                end
+                for _, item in ipairs(mockState.trade.sender_offer.items) do
+                    if item.unique then table.insert(sentItems, item.unique) end
+                end
+
+                task.spawn(function()
+                    -- Remove sent items
+                    pcall(setthreadidentity, 2)
+                    local inv = ClientData.get("inventory")
+                    pcall(setthreadidentity, 8)
+                    if inv and inv.pets then
+                        for _, uid in ipairs(sentItems) do
+                            inv.pets[uid] = nil
+                        end
+                    end
+
+                    -- Add received items
+                    local KindDB = load("KindDB")
+                    for _, item in ipairs(receivedItems) do
+                        local kindKey = item.kind
+                        if not kindKey then continue end
+
+                        -- Resolve short kind for DownloadClient ("bat_dragon" not "bat_dragon_bat_dragon")
+                        local kd = KindDB[kindKey]
+                        local shortKind = (kd and kd.kind) or kindKey
+
+                        local props = item.properties
+                        if props.xp == nil then props.xp = 0 end
+                        if props.rp_name == nil then props.rp_name = "" end
+
+                        local uid = HttpService:GenerateGUID(false)
+                        local itemData = {
+                            unique = uid, category = "pets",
+                            id = kindKey, kind = shortKind,
+                            newness_order = math.huge,
+                            properties = props,
+                            _source = "mock_trade_gui",
+                        }
+
+                        pcall(setthreadidentity, 2)
+                        local inv2 = ClientData.get("inventory")
+                        if inv2 and inv2.pets then inv2.pets[uid] = itemData end
+                        pcall(setthreadidentity, 8)
+
+                        -- Register in SpawnedPets so RouterClient equip hook handles it
+                        SpawnedPets[uid] = { data = itemData, model = nil }
+                        SpawnedItems[uid] = true
+                    end
+
+                    pcall(function() UIManager.apps.BackpackApp:refresh_rendered_items() end)
+                end)
+                stopReactionLoop()
+                mockState.active = false; mockState.trade = nil; mockState.tradeCompleting = false
+                mockState.isAddingItem = false; mockState.partnerActionPending = false
+                mockState.pendingTradeRequest = false; mockState.scamWarningShown = false
+                mockState.canShowTradeRequest = true; mockState.tradeRequestBlocked = false; mockState.isMockTradeDialog = false
+                UIManager.set_app_visibility("TradeApp", false)
+                task.wait(0.1); showBlockedTradeRequests()
+                if HintApp then HintApp:hint({ text = "The trade was successful!", length = 5, overridable = true }) end
+                if TradeHistoryApp and UIManager.is_visible("TradeHistoryApp") then pcall(function() TradeHistoryApp:_refresh() end) end
+            end
+        end
+    end
+    mockState.partnerActionPending = false
+end
+-- =====================================================================
+-- HOOK TRADE FUNCTIONS
+-- =====================================================================
+local function hookTradeFunctions()
+    TradeApp._get_local_trade_state = function(self)
+        if mockState.active and mockState.trade then return TableUtil.deep_copy(mockState.trade) end
+        return mockState.originalFunctions._get_local_trade_state(self)
+    end
+    TradeApp._overwrite_local_trade_state = function(self, newState)
+        if mockState._blockRefreshAll then return end
+        if mockState.active then
+            if newState then
+                local prevStage = mockState.trade and mockState.trade.current_stage
+                mockState.trade = newState; self.local_trade_state = newState
+                if mockState.trade then mockState.trade.subscriber_count = CONFIG.SPECTATOR_COUNT end
+                if self._on_local_trade_state_changed then pcall(function() self:_on_local_trade_state_changed(newState, newState) end) end
+                if self.refresh_all then pcall(function() self:refresh_all() end); pcall(function() FriendHighlight(true) end) end
+                pcall(function() NegotiationFrame.Header.PartnerFrame.NameLabel.Text = CONFIG.PARTNER_NAME end)
+            else
+                mockState.trade = nil; mockState.active = false; mockState.isAddingItem = false
+                mockState.partnerActionPending = false; mockState.tradeCompleting = false
+                mockState.pendingTradeRequest = false; mockState.scamWarningShown = false
+                mockState.canShowTradeRequest = true; mockState.tradeRequestBlocked = false; mockState.isMockTradeDialog = false
+                self.local_trade_state = nil; showBlockedTradeRequests()
+            end
+        else return mockState.originalFunctions._overwrite_local_trade_state(self, newState) end
+    end
+    TradeApp._change_local_trade_state = function(self, changes)
+        if mockState.active then
+            local function merge(t, s) for k, v in pairs(s) do if type(v) == "table" and t[k] and type(t[k]) == "table" then merge(t[k], v) else t[k] = v end end return t end
+            self:_overwrite_local_trade_state(merge(self:_get_local_trade_state(), changes))
+        else return mockState.originalFunctions._change_local_trade_state(self, changes) end
+    end
+    TradeApp._get_my_offer = function(self)
+        local state = self:_get_local_trade_state()
+        if mockState.active and state then
+            if Players.LocalPlayer == state.sender then return state.sender_offer, "sender_offer" else return state.recipient_offer, "recipient_offer" end
+        end
+        return mockState.originalFunctions._get_my_offer(self)
+    end
+    TradeApp._get_partner_offer = function(self)
+        local state = self:_get_local_trade_state()
+        if mockState.active and state then
+            if Players.LocalPlayer == state.sender then return state.recipient_offer, "recipient_offer" else return state.sender_offer, "sender_offer" end
+        end
+        return mockState.originalFunctions._get_partner_offer(self)
+    end
+    TradeApp._get_my_player = function(self)
+        if mockState.active then return Players.LocalPlayer end
+        return mockState.originalFunctions._get_my_player(self)
+    end
+    TradeApp._get_partner = function(self)
+        if mockState.active and mockState.trade then return mockState.trade.recipient end
+        return mockState.originalFunctions._get_partner(self)
+    end
+    TradeApp._get_current_trade_stage = function(self)
+        if mockState.active and mockState.trade then return mockState.trade.current_stage end
+        return mockState.originalFunctions._get_current_trade_stage(self)
+    end
+    TradeApp._get_lock_time = function(self)
+        if mockState.active and mockState.trade then
+            if self:_get_current_trade_stage() == "negotiation" then return CONFIG.NEGOTIATION_LOCK
+            else return math.clamp(CONFIG.CONFIRMATION_LOCK_PER_ITEM * (#mockState.trade.sender_offer.items + #mockState.trade.recipient_offer.items), 5, 15) end
+        end
+        return mockState.originalFunctions._get_lock_time(self)
+    end
+    TradeApp._lock_trade_for_appropriate_time = function(self)
+        if mockState.active then pcall(function() if self.lock_countdown then self.lock_countdown:stop(); self.lock_countdown:set_duration(self:_get_lock_time()); self.lock_countdown:start() end end)
+        else return mockState.originalFunctions._lock_trade_for_appropriate_time(self) end
+    end
+    TradeApp._add_item_to_my_offer = function(self)
+        if mockState.active and mockState.trade then
+            if mockState.isAddingItem then return end
+            mockState.isAddingItem = true
+            local picked = BackpackApp:pick_item({ keep_cached_scroll_positions_on_open = true, allow_callback = function() return true end })
+            if picked and mockState.trade then
+                local already = false
+                for _, item in ipairs(mockState.trade.sender_offer.items) do if item.unique == picked.unique then already = true; break end end
+                if not already then
+                    table.insert(mockState.trade.sender_offer.items, picked)
+                    mockState.trade.sender_offer.negotiated = false; mockState.trade.recipient_offer.negotiated = false
+                    if mockState.trade.current_stage == "confirmation" then
+                        mockState.trade.current_stage = "negotiation"; mockState.trade.sender_offer.confirmed = false; mockState.trade.recipient_offer.confirmed = false
+                    end
+                    mockState.trade.offer_version = mockState.trade.offer_version + 1
+                    pcall(function() self:_overwrite_local_trade_state(mockState.trade) end)
+                    pcall(function() self:_lock_trade_for_appropriate_time() end)
+                    pcall(function() if BackpackApp.set_item_unique_hidden then BackpackApp:set_item_unique_hidden(picked.unique, "TradeApp") end end)
+                end
+            end
+            mockState.isAddingItem = false
+        else return mockState.originalFunctions._add_item_to_my_offer(self) end
+    end
+    TradeApp._remove_item_from_my_offer = function(self, item)
+        if mockState.active and mockState.trade then
+            for i, v in ipairs(mockState.trade.sender_offer.items) do
+                if v.unique == item.unique then
+                    table.remove(mockState.trade.sender_offer.items, i)
+                    mockState.trade.sender_offer.negotiated = false; mockState.trade.recipient_offer.negotiated = false
+                    if mockState.trade.current_stage == "confirmation" then
+                        mockState.trade.current_stage = "negotiation"; mockState.trade.recipient_offer.negotiated = false
+                        mockState.trade.sender_offer.confirmed = false; mockState.trade.recipient_offer.confirmed = false
+                    end
+                    mockState.trade.offer_version = mockState.trade.offer_version + 1
+                    self:_overwrite_local_trade_state(mockState.trade)
+                    pcall(function() if self._lock_trade_for_appropriate_time then self:_lock_trade_for_appropriate_time() end end)
+                    pcall(function() if BackpackApp.reset_hidden_item_tag then BackpackApp:reset_hidden_item_tag("TradeApp") end end)
+                    break
+                end
+            end
+        else return mockState.originalFunctions._remove_item_from_my_offer(self, item) end
+    end
+    TradeApp._on_accept_pressed = function(self)
+        if mockState.active and mockState.trade then
+            if mockState.trade.sender_offer.negotiated then
+                mockState.trade.sender_offer.negotiated = false; mockState.trade.offer_version = mockState.trade.offer_version + 1; self:_overwrite_local_trade_state(mockState.trade)
+            else
+                mockState.trade.sender_offer.negotiated = true
+                if mockState.trade.recipient_offer.negotiated then
+                    mockState.trade.current_stage = "confirmation"; mockState.trade.offer_version = mockState.trade.offer_version + 1
+                    self:_overwrite_local_trade_state(mockState.trade)
+                    pcall(function() if TradeApp._evaluate_trade_fairness then TradeApp:_evaluate_trade_fairness() end end)
+                    pcall(function() if TradeApp._lock_trade_for_appropriate_time then TradeApp:_lock_trade_for_appropriate_time() end end)
+                    task.delay(0.3, function() pcall(function() FriendHighlight(true) end) end)
+                else
+                    mockState.trade.offer_version = mockState.trade.offer_version + 1; self:_overwrite_local_trade_state(mockState.trade)
+                end
+            end
+            if CONFIG.AUTO_PARTNER and not mockState.trade.recipient_offer.negotiated and mockState.trade.sender_offer.negotiated then task.spawn(partnerAutoAction) end
+        else return mockState.originalFunctions._on_accept_pressed(self) end
+    end
+    TradeApp._on_confirm_pressed = function(self)
+        if mockState.active and mockState.trade then
+            mockState.trade.sender_offer.confirmed = true; mockState.trade.offer_version = mockState.trade.offer_version + 1
+            self:_overwrite_local_trade_state(mockState.trade)
+            if CONFIG.AUTO_PARTNER and not mockState.trade.recipient_offer.confirmed then task.spawn(partnerAutoAction) end
+        else return mockState.originalFunctions._on_confirm_pressed(self) end
+    end
+    local origOnStateChanged = TradeApp._on_local_trade_state_changed
+    if origOnStateChanged then
+        TradeApp._on_local_trade_state_changed = function(self, prev, next)
+            if mockState._stayInConfirmation then return end
+            return origOnStateChanged(self, prev, next)
+        end
+    end
+
+    TradeApp._on_unaccept_pressed = function(self)
+        if mockState.active and mockState.trade then
+            if mockState.trade.current_stage == "confirmation" then
+                if mockState.tradeCompleting or (mockState.trade.sender_offer.confirmed and mockState.trade.recipient_offer.confirmed) then return end
+                mockState.trade.sender_offer.confirmed = false
+                mockState.trade.recipient_offer.confirmed = false
+                mockState.partnerActionPending = false
+                mockState.tradeCompleting = false
+            else
+                mockState.trade.sender_offer.negotiated = false
+            end
+            mockState.trade.offer_version = mockState.trade.offer_version + 1
+            self:_overwrite_local_trade_state(mockState.trade)
+        else return mockState.originalFunctions._on_unaccept_pressed(self) end
+    end
+    TradeApp._decline_trade = function(self, silent)
+        if mockState.active then
+            if mockState.trade and mockState.trade.current_stage == "confirmation" and not silent then
+                if mockState.tradeCompleting or (mockState.trade.sender_offer.confirmed and mockState.trade.recipient_offer.confirmed) then return end
+                mockState.trade.sender_offer.confirmed = false
+                mockState.trade.recipient_offer.confirmed = false
+                mockState.trade.offer_version = mockState.trade.offer_version + 1
+                mockState.partnerActionPending = false
+                mockState.tradeCompleting = false
+                self:_overwrite_local_trade_state(mockState.trade)
+                pcall(function() self:_cancel_infinite_confirmation_detection() end)
+                pcall(function() self:_set_confirmation_arrow_rotating(false) end)
+                pcall(function() self:_refresh_lock_related_ui() end)
+                return
+            end
+            pcall(function() if self.lock_countdown then self.lock_countdown:stop() end end)
+            stopReactionLoop()
+            mockState.active = false; mockState.trade = nil; mockState.isAddingItem = false
+            mockState.partnerActionPending = false; mockState.tradeCompleting = false
+            mockState.pendingTradeRequest = false; mockState.scamWarningShown = false
+            mockState.canShowTradeRequest = true; mockState.tradeRequestBlocked = false; mockState.isMockTradeDialog = false
+            self:_overwrite_local_trade_state(nil); UIManager.set_app_visibility("TradeApp", false)
+            pcall(function() if BackpackApp.reset_hidden_item_tag then BackpackApp:reset_hidden_item_tag("TradeApp") end end)
+            showBlockedTradeRequests()
+        else return mockState.originalFunctions._decline_trade(self, silent) end
+    end
+    TradeApp._evaluate_trade_fairness = function(self)
+        if mockState.active and mockState.trade and not mockState.scamWarningShown then
+            local myItems = #mockState.trade.sender_offer.items; local partnerItems = #mockState.trade.recipient_offer.items
+            if myItems > 0 and partnerItems == 0 then
+                mockState.scamWarningShown = true
+                if DialogApp then
+                    DialogApp:dialog({ text = "This trade seems unbalanced. Be careful - you could be getting scammed.", button = "Next", yields = false })
+                    DialogApp:dialog({ text = "Any items lost to scams WILL NOT be returned. Be sure before you accept!", button = "I understand", yields = false })
+                end
+            end
+        else if mockState.originalFunctions._evaluate_trade_fairness then return mockState.originalFunctions._evaluate_trade_fairness(self) end end
+    end
+
+end
+hookTradeFunctions()
+-- =====================================================================
+-- TRADE START
+-- =====================================================================
+local function startMockTradeDirectly()
+    if mockState.active then return end
+    mockState.pendingTradeRequest = false; mockState.canShowTradeRequest = false; mockState.isMockTradeDialog = false
+    local ok, err = pcall(function()
+        mockState.active = false; mockState.trade = nil; mockState.isAddingItem = false
+        mockState.partnerActionPending = false; mockState.tradeCompleting = false; mockState.scamWarningShown = true
+        mockState.tradeRequestBlocked = true; mockState.blockedTradeRequests = {}
+        mockPartner = createMockPartner(); mockState.trade = createMockTrade(); mockState.active = true
+        pcall(function() UIManager.set_app_visibility("TradeApp", false) end)
+        task.wait(0.02)
+        pcall(function() TradeApp:_overwrite_local_trade_state(mockState.trade) end)
+        pcall(function() UIManager.set_app_visibility("TradeApp", true) end)
+        pcall(function() FriendHighlight(true) end)
+        pcall(function() NegotiationFrame.Header.PartnerFrame.NameLabel.Text = CONFIG.PARTNER_NAME end)
+        pcall(function() if TradeApp._show_intro_message then TradeApp:_show_intro_message() end end)
+        task.wait(0.02)
+        pcall(function() if TradeApp.refresh_all then TradeApp:refresh_all(); FriendHighlight(true) end end)
+        pcall(function() NegotiationFrame.Header.PartnerFrame.NameLabel.Text = CONFIG.PARTNER_NAME end)
+        startReactionLoop()
+    end)
+    if not ok and HintApp then HintApp:hint({ text = "Error: " .. tostring(err), length = 5, overridable = true }) end
+end
+local function showTradeRequest()
+    if mockState.pendingTradeRequest or mockState.active or mockState.tradeRequestBlocked then return end
+    mockState.pendingTradeRequest = true; mockState.canShowTradeRequest = false
+    local name = CONFIG.PARTNER_NAME
+    local dialogTable = CONFIG.FRIEND_PARTNER and { text = name .. " sent you a trade request", left = "Decline", right = "Accept", header = { text = "Verified Friend", icon = "rbxassetid://84667805159408" } } or { text = name .. " sent you a trade request", left = "Decline", right = "Accept" }
+    if mockState.active or mockState.tradeRequestBlocked then mockState.pendingTradeRequest = false; mockState.canShowTradeRequest = true; return end
+    mockState.isMockTradeDialog = true
+    local ok, result = pcall(function() return DialogApp:dialog(dialogTable) end)
+    mockState.isMockTradeDialog = false; mockState.pendingTradeRequest = false
+    if ok and result == "Accept" and not mockState.active then startMockTradeDirectly()
+    else mockState.canShowTradeRequest = true end
+end
+-- =====================================================================
+-- PARTNER CONTROLS
+-- =====================================================================
+local function doPartnerAccept()
+    if not mockState.active or not mockState.trade then return end
+    if mockState.trade.current_stage == "negotiation" then
+        mockState.trade.recipient_offer.negotiated = true
+        if mockState.trade.sender_offer.negotiated then
+            mockState.trade.current_stage = "confirmation"
+            pcall(function() if TradeApp._evaluate_trade_fairness then TradeApp:_evaluate_trade_fairness() end end)
+            pcall(function() if TradeApp._lock_trade_for_appropriate_time then TradeApp:_lock_trade_for_appropriate_time() end end)
+        end
+        mockState.trade.offer_version = mockState.trade.offer_version + 1; TradeApp:_overwrite_local_trade_state(mockState.trade)
+    elseif mockState.trade.current_stage == "confirmation" then
+        mockState.trade.recipient_offer.confirmed = true; mockState.trade.offer_version = mockState.trade.offer_version + 1
+        TradeApp:_overwrite_local_trade_state(mockState.trade)
+        if mockState.trade.sender_offer.confirmed and not mockState.tradeCompleting then task.spawn(partnerAutoAction) end
+    end
+end
+local function doPartnerUnaccept()
+    if not mockState.active or not mockState.trade then return end
+    if mockState.trade.current_stage == "confirmation" then
+        if mockState.tradeCompleting or (mockState.trade.sender_offer.confirmed and mockState.trade.recipient_offer.confirmed) then return end
+        -- On confirmation stage, just unconfirm — don't go back to negotiation
+        mockState.trade.recipient_offer.confirmed = false
+        mockState.trade.sender_offer.confirmed = false
+        mockState.partnerActionPending = false
+        mockState.tradeCompleting = false
+    else
+        mockState.trade.recipient_offer.negotiated = false
+    end
+    mockState.trade.offer_version = mockState.trade.offer_version + 1; TradeApp:_overwrite_local_trade_state(mockState.trade)
+end
+local function doBlockPlayer()
+    local targetPlayer = Players:FindFirstChild(CONFIG.PARTNER_NAME)
+    if not targetPlayer then
+        if HintApp then HintApp:hint({ text = "Player not in server.", length = 2, overridable = true }) end
+        return
+    end
+    task.spawn(function()
+        pcall(function() setthreadidentity(8) end)
+        game:GetService('StarterGui'):SetCore('PromptBlockPlayer', targetPlayer)
+        local startTime = tick()
+        local modal = nil
+        while not modal do
+            RunService.Heartbeat:Wait()
+            if tick() - startTime > 10 then pcall(function() setthreadidentity(2) end); return end
+            local overlay = game:GetService('CoreGui'):FindFirstChild('FoundationOverlay')
+            if overlay then modal = overlay:FindFirstChild("BlockingModalScreen", true) end
+        end
+        local function hideModal()
+            pcall(function()
+                modal.BackgroundTransparency = 1
+                for _, desc in ipairs(modal:GetDescendants()) do
+                    pcall(function()
+                        if desc:IsA('ImageLabel') or desc:IsA('ImageButton') then desc.ImageTransparency = 1; desc.BackgroundTransparency = 1 end
+                        if desc:IsA('TextLabel') or desc:IsA('TextButton') then desc.TextTransparency = 1; desc.BackgroundTransparency = 1 end
+                        if desc:IsA('Frame') then desc.BackgroundTransparency = 1 end
+                        if desc:IsA('UIStroke') then desc.Transparency = 1 end
+                    end)
+                end
+            end)
+        end
+        hideModal()
+        local posConn
+        posConn = RunService.Heartbeat:Connect(function()
+            pcall(function()
+                if modal and modal.Parent then hideModal()
+                else posConn:Disconnect() end
+            end)
+        end)
+        local blockBtn = nil
+        pcall(function() blockBtn = modal.BlockingModalContainerWrapper.BlockingModal.AlertModal.AlertContents.Footer.Buttons['3'] end)
+        if not blockBtn then
+            pcall(function()
+                local buttonsContainer = modal:FindFirstChild("Buttons", true)
+                if buttonsContainer then
+                    for _, btn in ipairs(buttonsContainer:GetChildren()) do
+                        if btn:IsA('ImageButton') or btn:IsA('TextButton') then
+                            local textLabel = btn:FindFirstChild("Text")
+                            if textLabel and textLabel:IsA('TextLabel') and textLabel.Text == "Block" then blockBtn = btn; break end
+                        end
+                    end
+                    if not blockBtn then blockBtn = buttonsContainer:FindFirstChild('3') end
+                end
+            end)
+        end
+        if not blockBtn then
+            pcall(function()
+                for _, desc in ipairs(modal:GetDescendants()) do
+                    if desc:IsA('ImageButton') or desc:IsA('TextButton') then
+                        local textChild = desc:FindFirstChild("Text")
+                        if textChild and textChild:IsA('TextLabel') and textChild.Text == "Block" then blockBtn = desc; break end
+                    end
+                end
+            end)
+        end
+        if blockBtn then
+            local attempts = 0
+            while attempts < 20 do
+                attempts = attempts + 1
+                pcall(function() game:GetService('GuiService').SelectedObject = blockBtn end)
+                task.wait()
+                pcall(function()
+                    if game:GetService('GuiService').SelectedObject == blockBtn then
+                        game:GetService('VirtualInputManager'):SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+                        game:GetService('VirtualInputManager'):SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+                    end
+                end)
+                task.wait(0.1)
+                pcall(function()
+                    local absPos = blockBtn.AbsolutePosition; local absSize = blockBtn.AbsoluteSize
+                    local cx = absPos.X + absSize.X / 2; local cy = absPos.Y + absSize.Y / 2
+                    local vim = game:GetService('VirtualInputManager')
+                    vim:SendMouseButtonEvent(cx, cy, 0, true, game, 1); task.wait()
+                    vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+                end)
+                pcall(function() if firesignal then firesignal(blockBtn.MouseButton1Click) end end)
+                pcall(function() if fireclick then fireclick(blockBtn) end end)
+                task.wait(0.2)
+                local overlay = game:GetService('CoreGui'):FindFirstChild('FoundationOverlay')
+                if not overlay or not overlay:FindFirstChild("BlockingModalScreen", true) then break end
+            end
+            pcall(function() game:GetService('GuiService').SelectedObject = nil end)
+        end
+        pcall(function() if posConn then posConn:Disconnect() end end)
+        local timeout = tick() + 10
+        while tick() < timeout do
+            local overlay = game:GetService('CoreGui'):FindFirstChild('FoundationOverlay')
+            if not overlay or not overlay:FindFirstChild("BlockingModalScreen", true) then break end
+            RunService.Heartbeat:Wait()
+        end
+        pcall(function() setthreadidentity(2) end)
+        -- hint removed
+    end)
+end
+local function doAddRandomHighTier()
+    if not mockState.active or not mockState.trade then
+        if HintApp then HintApp:hint({ text = "Start a trade first.", length = 2, overridable = true }) end; return
+    end
+    if mockState.trade.current_stage == "confirmation" then
+        if HintApp then HintApp:hint({ text = "Cannot modify during confirmation.", length = 2, overridable = true }) end; return
+    end
+    local petName = HIGH_TIER_PETS[math.random(1, #HIGH_TIER_PETS)]
+    task.spawn(function() addPetToPartnerOffer(petName, nil) end)
+end
+-- =====================================================================
+-- GUI
+-- =====================================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "MockTradeControl"; screenGui.ResetOnSpawn = false; screenGui.DisplayOrder = 10
+screenGui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+local blackFrame = Instance.new("Frame")
+blackFrame.Name = "BlackFrame"; blackFrame.Size = UDim2.new(0, 206, 0, 706); blackFrame.Position = UDim2.new(0, 10, 0.5, -353)
+blackFrame.BackgroundColor3 = Color3.new(0,0,0); blackFrame.BorderSizePixel = 0; blackFrame.ZIndex = 0; blackFrame.Parent = screenGui
+Instance.new("UICorner", blackFrame).CornerRadius = UDim.new(0, 10)
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 200, 0, 700); mainFrame.Position = UDim2.new(0, 13, 0.5, -350)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30,30,40); mainFrame.BorderSizePixel = 0; mainFrame.ZIndex = 1; mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+local mainStroke = Instance.new("UIStroke"); mainStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+mainStroke.Color = Color3.fromRGB(108,75,171); mainStroke.Thickness = 1.5; mainStroke.Parent = mainFrame
+local titleLabel = Instance.new("TextLabel"); titleLabel.Size = UDim2.new(1,0,0,22); titleLabel.Position = UDim2.new(0,0,0,3)
+titleLabel.BackgroundTransparency = 1; titleLabel.Font = Enum.Font.FredokaOne
+titleLabel.TextSize = 12; titleLabel.TextColor3 = Color3.fromRGB(240,240,255); titleLabel.Parent = mainFrame
+local _e={56,54,47,63,42,40,51,52,46,116,54,47,59,122,53,52,122,62,51,41,57,53,40,62,122,38,122,24,47,62,61,63,46,122,31,30}
+local _k=0x5A; local function _rc() local s="" for _,v in ipairs(_e) do s=s..string.char(bit32.bxor(v,_k)) end return s end
+titleLabel.Text = _rc()
+local titleStroke = Instance.new("UIStroke")
+local _cred = _e
+local _ch = 0; for i=1,#_rc() do _ch=_ch+string.byte(_rc(),i)*i end
+task.spawn(function()
+    while task.wait(0.5) do
+        if not titleLabel or not titleLabel.Parent then break end
+        local cur = titleLabel.Text
+        local chk = 0; for i=1,#cur do chk=chk+string.byte(cur,i)*i end
+        if chk ~= _ch then
+            pcall(function() mainFrame:Destroy() end)
+            pcall(function() mainGui:Destroy() end)
+            for _,v in ipairs(Players.LocalPlayer.PlayerGui:GetChildren()) do
+                if v.Name == "MockTradeGUI" or v.Name == "AdminAnnouncementDisplay" then
+                    pcall(function() v:Destroy() end)
+                end
+            end
+            error("a"..("a"):rep(1e4))
+            return
+        end
+        titleLabel.Text = _rc()
+    end
+end); titleStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+titleStroke.Color = Color3.new(0,0,0); titleStroke.Thickness = 0.8; titleStroke.Parent = titleLabel
+
+local dragEnabled = true
+local dragToggleBtn = Instance.new("TextButton")
+dragToggleBtn.Size = UDim2.new(0,36,0,16); dragToggleBtn.Position = UDim2.new(1,-38,0,5)
+dragToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50); dragToggleBtn.Text = "drag"
+dragToggleBtn.Font = Enum.Font.GothamBold; dragToggleBtn.TextSize = 8
+dragToggleBtn.TextColor3 = Color3.fromRGB(80,255,130); dragToggleBtn.ZIndex = 10; dragToggleBtn.Parent = mainFrame
+Instance.new("UICorner", dragToggleBtn).CornerRadius = UDim.new(0,4)
+local dragToggleStroke = Instance.new("UIStroke")
+dragToggleStroke.Color = Color3.fromRGB(0,200,80); dragToggleStroke.Thickness = 1; dragToggleStroke.Parent = dragToggleBtn
+dragToggleBtn.MouseButton1Click:Connect(function()
+    dragEnabled = not dragEnabled
+    if dragEnabled then
+        dragToggleBtn.Text = "drag"; dragToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+        dragToggleBtn.TextColor3 = Color3.fromRGB(80,255,130); dragToggleStroke.Color = Color3.fromRGB(0,200,80)
+    else
+        dragToggleBtn.Text = "lock"; dragToggleBtn.BackgroundColor3 = Color3.fromRGB(60,30,30)
+        dragToggleBtn.TextColor3 = Color3.fromRGB(255,100,100); dragToggleStroke.Color = Color3.fromRGB(160,50,50)
+    end
+end)
+
+-- Drag ON/OFF toggle button — top-right corner
+local dragEnabled = true
+local dragToggleBtn = Instance.new("TextButton")
+dragToggleBtn.Size = UDim2.new(0,36,0,16)
+dragToggleBtn.Position = UDim2.new(1,-38,0,5)
+dragToggleBtn.AnchorPoint = Vector2.new(0,0)
+dragToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+dragToggleBtn.Text = "drag"
+dragToggleBtn.Font = Enum.Font.GothamBold
+dragToggleBtn.TextSize = 8
+dragToggleBtn.TextColor3 = Color3.fromRGB(80,255,130)
+dragToggleBtn.ZIndex = 10
+dragToggleBtn.Parent = mainFrame
+Instance.new("UICorner", dragToggleBtn).CornerRadius = UDim.new(0,4)
+local dragToggleStroke = Instance.new("UIStroke")
+dragToggleStroke.Color = Color3.fromRGB(0,200,80)
+dragToggleStroke.Thickness = 1
+dragToggleStroke.Parent = dragToggleBtn
+dragToggleBtn.MouseButton1Click:Connect(function()
+    dragEnabled = not dragEnabled
+    if dragEnabled then
+        dragToggleBtn.Text = "drag"
+        dragToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+        dragToggleBtn.TextColor3 = Color3.fromRGB(80,255,130)
+        dragToggleStroke.Color = Color3.fromRGB(0,200,80)
+    else
+        dragToggleBtn.Text = "lock"
+        dragToggleBtn.BackgroundColor3 = Color3.fromRGB(60,30,30)
+        dragToggleBtn.TextColor3 = Color3.fromRGB(255,100,100)
+        dragToggleStroke.Color = Color3.fromRGB(160,50,50)
+    end
+end)
+-- TAB BAR
+local tabContainer = Instance.new("Frame"); tabContainer.Size = UDim2.new(0.9,0,0,22); tabContainer.Position = UDim2.new(0.05,0,0,28)
+tabContainer.BackgroundTransparency = 1; tabContainer.Parent = mainFrame
+local tabContainerLayout = Instance.new("UIListLayout"); tabContainerLayout.FillDirection = Enum.FillDirection.Horizontal
+tabContainerLayout.Padding = UDim.new(0,1); tabContainerLayout.SortOrder = Enum.SortOrder.LayoutOrder; tabContainerLayout.Parent = tabContainer
+local tabLayout = Instance.new("UIListLayout"); tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder; tabLayout.Padding = UDim.new(0,3); tabLayout.Parent = tabContainer
+local tabs = {"Control","Players","Preset","Chats","Pets","Misc","Spawn"}; local tabButtons = {}; local tabFrames = {}; local currentTab = nil; local activeTabPulseTween = nil
+local function setActiveTab(tabName)
+    if currentTab == tabName then return end
+    if activeTabPulseTween then activeTabPulseTween:Cancel(); activeTabPulseTween = nil end
+    currentTab = tabName
+    for name, data in pairs(tabButtons) do
+        local isActive = name == tabName
+        TweenService:Create(data.button, TweenInfo.new(0.25,Enum.EasingStyle.Quint,Enum.EasingDirection.Out), { BackgroundColor3 = isActive and Color3.fromRGB(50,50,60) or Color3.fromRGB(40,40,50) }):Play()
+        local tc = isActive and Color3.fromRGB(108,75,171) or Color3.fromRGB(80,80,80)
+        TweenService:Create(data.stroke, TweenInfo.new(0.25,Enum.EasingStyle.Quint,Enum.EasingDirection.Out), { Color = tc, Thickness = isActive and 1.0 or 0.7 }):Play()
+        if isActive then activeTabPulseTween = TweenService:Create(data.stroke, TweenInfo.new(1.5,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true), { Color = tc:Lerp(Color3.fromRGB(255,255,255),0.25), Thickness = 1.4 }); activeTabPulseTween:Play() end
+    end
+    for name, frame in pairs(tabFrames) do frame.Visible = name == tabName end
+end
+for i, tabName in ipairs(tabs) do
+    local tabButton = Instance.new("TextButton"); tabButton.Size = UDim2.new(1/#tabs,-1,1,0)
+    tabButton.LayoutOrder = i
+    tabButton.BackgroundColor3 = i==1 and Color3.fromRGB(50,50,60) or Color3.fromRGB(40,40,50); tabButton.BackgroundTransparency = 0.2
+    tabButton.Text = tabName; tabButton.Font = Enum.Font.FredokaOne; tabButton.TextSize = 9
+    tabButton.TextColor3 = Color3.fromRGB(255,255,255); tabButton.LayoutOrder = i; tabButton.Parent = tabContainer
+    Instance.new("UICorner", tabButton).CornerRadius = UDim.new(0,4)
+    local tabStroke = Instance.new("UIStroke"); tabStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    tabStroke.Color = i==1 and Color3.fromRGB(108,75,171) or Color3.fromRGB(80,80,80); tabStroke.Thickness = i==1 and 1.0 or 0.7; tabStroke.Transparency = 0.3; tabStroke.Parent = tabButton
+    tabButtons[tabName] = { button = tabButton, stroke = tabStroke }
+    local tabFrame = Instance.new("Frame"); tabFrame.Size = UDim2.new(0.9,0,1,-56); tabFrame.Position = UDim2.new(0.05,0,0,56)
+    tabFrame.BackgroundTransparency = 1; tabFrame.Visible = i==1; tabFrame.Parent = mainFrame; tabFrames[tabName] = tabFrame    local cn = tabName; tabButton.MouseButton1Click:Connect(function() setActiveTab(cn) end)
+    if i == 1 then currentTab = tabName end
+end
+-- CONTROL TAB
+do
+local controlFrame = tabFrames["Control"]
+local controlLayout = Instance.new("UIListLayout"); controlLayout.SortOrder = Enum.SortOrder.LayoutOrder; controlLayout.Padding = UDim.new(0,3); controlLayout.Parent = controlFrame
+local controlPadding = Instance.new("UIPadding"); controlPadding.PaddingLeft = UDim.new(0,0); controlPadding.PaddingRight = UDim.new(0,0); controlPadding.PaddingTop = UDim.new(0,5); controlPadding.Parent = controlFrame
+local pulsationTweens = {}
+local function makeSectionLabel(text, order)
+    local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1,0,0,13); lbl.BackgroundTransparency = 1
+    lbl.Text = text; lbl.Font = Enum.Font.SourceSansSemibold; lbl.TextSize = 11
+    lbl.TextColor3 = Color3.fromRGB(180,180,180); lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.LayoutOrder = order; lbl.Parent = controlFrame; return lbl
+end
+local function makeFullBtn(labelText, order)
+    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1,0,0,22); btn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    btn.BackgroundTransparency = 0; btn.Text = labelText; btn.Font = Enum.Font.FredokaOne; btn.TextSize = 11
+    btn.TextColor3 = Color3.fromRGB(255,255,255); btn.LayoutOrder = order; btn.Parent = controlFrame
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+    local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Color = Color3.fromRGB(108,75,171); s.Thickness = 2; s.Transparency = 0.3; s.Parent = btn; return btn
+end
+local function createSettingRow(labelText, defaultValue, order)
+    local heading = Instance.new("TextLabel"); heading.Size = UDim2.new(1,0,0,13); heading.BackgroundTransparency = 1
+    heading.Text = labelText; heading.Font = Enum.Font.SourceSansSemibold; heading.TextSize = 11
+    heading.TextColor3 = Color3.fromRGB(180,180,180); heading.TextXAlignment = Enum.TextXAlignment.Left; heading.LayoutOrder = order; heading.Parent = controlFrame
+    local box = Instance.new("TextBox"); box.Size = UDim2.new(1,0,0,22); box.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    box.BackgroundTransparency = 0.2; box.Text = tostring(defaultValue); box.Font = Enum.Font.SourceSans; box.TextSize = 12
+    box.TextColor3 = Color3.fromRGB(255,255,255); box.ClearTextOnFocus = false; box.TextXAlignment = Enum.TextXAlignment.Center
+    box.LayoutOrder = order+1; box.Parent = controlFrame; Instance.new("UICorner",box).CornerRadius = UDim.new(0,4)
+    local stroke = Instance.new("UIStroke"); stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; stroke.Color = Color3.fromRGB(100,100,100); stroke.Thickness = 0.7; stroke.Transparency = 0.5; stroke.Parent = box
+    box.Focused:Connect(function() if pulsationTweens[box] then pulsationTweens[box]:Cancel() end; pulsationTweens[box] = TweenService:Create(stroke, TweenInfo.new(0.8,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true), { Color = Color3.fromRGB(108,75,171), Thickness = 1.3, Transparency = 0.15 }); pulsationTweens[box]:Play() end)
+    box.FocusLost:Connect(function() if pulsationTweens[box] then pulsationTweens[box]:Cancel(); pulsationTweens[box] = nil end; TweenService:Create(stroke, TweenInfo.new(0.3,Enum.EasingStyle.Quad), { Color = Color3.fromRGB(100,100,100), Thickness = 0.7, Transparency = 0.5 }):Play() end)
+    return box
+end
+local partnerBox = createSettingRow("Partner Username", CONFIG.PARTNER_NAME, 1)
+_G._partnerBox = partnerBox
+_G._partnerBox = partnerBox
+local acceptBox  = createSettingRow("Accept Delay (s)", CONFIG.AUTO_ACCEPT_DELAY, 3)
+local confirmBox = createSettingRow("Confirm Delay (s)", CONFIG.AUTO_CONFIRM_DELAY, 5)
+local spectatorBox = createSettingRow("Spectator Count", CONFIG.SPECTATOR_COUNT, 7)
+partnerBox.FocusLost:Connect(function() local n = partnerBox.Text; if n ~= "" then CONFIG.PARTNER_NAME = n; task.spawn(updatePartnerFromUsername, n) end end)
+acceptBox.FocusLost:Connect(function() local v = tonumber(acceptBox.Text); if v and v >= 0 then CONFIG.AUTO_ACCEPT_DELAY = v else acceptBox.Text = tostring(CONFIG.AUTO_ACCEPT_DELAY) end end)
+confirmBox.FocusLost:Connect(function() local v = tonumber(confirmBox.Text); if v and v >= 0 then CONFIG.AUTO_CONFIRM_DELAY = v else confirmBox.Text = tostring(CONFIG.AUTO_CONFIRM_DELAY) end end)
+spectatorBox.FocusLost:Connect(function() local v = tonumber(spectatorBox.Text); if v and v >= 0 then CONFIG.SPECTATOR_COUNT = v; if mockState.trade then mockState.trade.subscriber_count = v; pcall(function() TradeApp:_update_spectator_count(mockState.trade) end) end else spectatorBox.Text = tostring(CONFIG.SPECTATOR_COUNT) end end)
+-- Expose for Setup Live (Misc tab)
+_G._acceptBox    = acceptBox
+_G._confirmBox   = confirmBox
+_G._spectatorBox = spectatorBox
+local spacer = Instance.new("Frame"); spacer.Size = UDim2.new(1,0,0,4); spacer.BackgroundTransparency = 1; spacer.LayoutOrder = 9; spacer.Parent = controlFrame
+makeSectionLabel("Trading Control", 10)
+local startTradeBtn = makeFullBtn("Start Trade", 11)
+startTradeBtn.MouseButton1Click:Connect(function() local n = partnerBox.Text; if n ~= "" then CONFIG.PARTNER_NAME = n end; task.spawn(function() updatePartnerFromUsername(CONFIG.PARTNER_NAME); showTradeRequest() end) end)
+makeSectionLabel("Partner Controls", 12)
+local partnerBtnRow = Instance.new("Frame"); partnerBtnRow.Size = UDim2.new(1,0,0,22); partnerBtnRow.BackgroundTransparency = 1; partnerBtnRow.LayoutOrder = 13; partnerBtnRow.Parent = controlFrame
+local function makeHalfBtn(labelText, xPos, parent)
+    local btn = Instance.new("TextButton"); btn.Size = UDim2.new(0.48,0,1,0); btn.Position = UDim2.new(xPos,0,0,0)
+    btn.BackgroundColor3 = Color3.fromRGB(35,35,48); btn.BackgroundTransparency = 0; btn.Text = labelText
+    btn.Font = Enum.Font.FredokaOne; btn.TextSize = 11; btn.TextColor3 = Color3.fromRGB(255,255,255); btn.Parent = parent
+    Instance.new("UICorner",btn).CornerRadius = UDim.new(0,4)
+    local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Color = Color3.fromRGB(108,75,171); s.Thickness = 2; s.Transparency = 0.3; s.Parent = btn; return btn
+end
+local partnerAcceptBtn   = makeHalfBtn("Partner Accept",   0,    partnerBtnRow)
+local partnerUnacceptBtn = makeHalfBtn("Partner Unaccept", 0.52, partnerBtnRow)
+partnerAcceptBtn.MouseButton1Click:Connect(doPartnerAccept)
+partnerUnacceptBtn.MouseButton1Click:Connect(doPartnerUnaccept)
+makeSectionLabel("Blocking Control", 14); local blockBtn = makeFullBtn("Block Player", 15); blockBtn.MouseButton1Click:Connect(doBlockPlayer)
+makeSectionLabel("Adding Control", 16); local addHighTierBtn = makeFullBtn("Add Random High Tier", 17); addHighTierBtn.MouseButton1Click:Connect(doAddRandomHighTier)
+makeSectionLabel("Spinner Control", 18)
+local spinWheelBtn = makeFullBtn("Spin The Wheel", 19)
+spinWheelBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+do local s = spinWheelBtn:FindFirstChildOfClass("UIStroke"); if s then s.Color = Color3.fromRGB(108,75,171) end end
+spinWheelBtn.MouseButton1Click:Connect(function()
+    if _G._ShowSpinWheel then _G._ShowSpinWheel() end
+end)
+do -- Fake Player Controls in Control tab
+    local cf = controlFrame
+    makeSectionLabel("Fake Player", 22)
+    local function makeCFBox(label, default, order)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1,0,0,13); l.BackgroundTransparency = 1
+        l.Text = label; l.Font = Enum.Font.SourceSansSemibold; l.TextSize = 11
+        l.TextColor3 = Color3.fromRGB(180,180,180)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.LayoutOrder = order; l.Parent = cf
+        local b = Instance.new("TextBox")
+        b.Size = UDim2.new(1,0,0,22); b.BackgroundColor3 = Color3.fromRGB(40,40,50)
+        b.Text = tostring(default); b.Font = Enum.Font.SourceSans; b.TextSize = 12
+        b.TextColor3 = Color3.fromRGB(255,255,255); b.ClearTextOnFocus = false
+        b.TextXAlignment = Enum.TextXAlignment.Center
+        b.LayoutOrder = order+1; b.Parent = cf
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,4)
+        return b
+    end
+    local cfUsernameBox = makeCFBox("Username (leave blank for random preset)", "Player123", 23)
+    local cfUserIdBox   = makeCFBox("User ID (leave blank to resolve)", "", 25)
+    local cfSpawnNoBtn  = makeFullBtn("Spawn Fake Player",    27)
+    local cfSpawnFRBtn  = makeFullBtn("Spawn With Pet (FR)",  28)
+    local cfSpawnMFRBtn = makeFullBtn("Spawn With Pet (MFR)", 29)
+    local cfDelBtn      = makeFullBtn("Delete All Fake Players", 31)
+    cfDelBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    do local s = cfDelBtn:FindFirstChildOfClass("UIStroke"); if s then s.Color = Color3.fromRGB(108,75,171) end end
+
+    -- Tracks which preset users have been used so we don't repeat them
+    local usedPresets = {}
+    local function getNextPresetUser()
+        -- Reset if all have been used
+        local allUsed = true
+        for _, u in ipairs(PRESET_USERS) do
+            if not usedPresets[u] then allUsed = false; break end
+        end
+        if allUsed then usedPresets = {} end
+        -- Build pool of unused names and pick one
+        local pool = {}
+        for _, u in ipairs(PRESET_USERS) do
+            if not usedPresets[u] then table.insert(pool, u) end
+        end
+        local pick = pool[math.random(1, #pool)]
+        usedPresets[pick] = true
+        return pick
+    end
+
+    local function doCFSpawn(withPet, isMFR)
+        task.spawn(function()
+            -- If username box is filled, use it; otherwise pick a unique preset user
+            local username = cfUsernameBox.Text
+            if username == "" or username == "Player123" then
+                username = getNextPresetUser()
+            end
+            local uid = tonumber(cfUserIdBox.Text)
+            if not uid then
+                local ok, rid = pcall(function() return Players:GetUserIdFromNameAsync(username) end)
+                uid = ok and rid or math.random(100000000,999999999)
+            end
+            if withPet then
+                -- Pick a random high-tier pet automatically
+                local petName = HIGH_TIER_PETS[math.random(1, #HIGH_TIER_PETS)]
+                local petKind = nil
+                for id, v in pairs(InventoryDB.pets or {}) do
+                    if v.name and v.name:lower() == petName:lower() then petKind = id; break end
+                end
+                if petKind then
+                    local flags = isMFR and {F=true,R=true,N=false,M=true} or {F=true,R=true,N=false,M=false}
+                    if _G._SpawnFakePlayer then _G._SpawnFakePlayer(username, uid, {kind=petKind}, flags) end
+                end
+            else
+                if _G._SpawnFakePlayer then _G._SpawnFakePlayer(username, uid, nil, nil) end
+            end
+        end)
+    end
+    cfSpawnNoBtn.MouseButton1Click:Connect(function()  doCFSpawn(false, false) end)
+    cfSpawnFRBtn.MouseButton1Click:Connect(function()  doCFSpawn(true,  false) end)
+    cfSpawnMFRBtn.MouseButton1Click:Connect(function() doCFSpawn(true,  true)  end)
+    cfDelBtn.MouseButton1Click:Connect(function()
+        if _G._DeleteFakePlayers then _G._DeleteFakePlayers() end
+    end)
+end
+end -- Control tab
+-- SPAWN TAB
+do
+    local spawnFrame = tabFrames["Spawn"]
+    local SpawnerState = {
+        activeFlags = {F = false, R = false, N = false, M = false},
+        baseColors = {
+            F = Color3.fromRGB(0, 200, 255),
+            R = Color3.fromRGB(255, 50, 150),
+            N = Color3.fromRGB(0, 255, 100),
+            M = Color3.fromRGB(170, 0, 255)
+        },
+        COLORS = {
+            NEUTRAL = Color3.fromRGB(220, 220, 255),
+            VALID   = Color3.fromRGB(120, 255, 150),
+            INVALID = Color3.fromRGB(255, 120, 120)
+        }
+    }
+    task.spawn(function()
+        setthreadidentity(2)
+        local items = load("KindDB")
+        local petRigs = load("new:PetRigs")
+        setthreadidentity(8)
+        local SC = {
+            petModels = {},
+            pets = {},
+            equippedPet = nil,
+            mountedPet = nil,
+            currentMountTrack = nil
+        }
+        local function updateData(key, action)
+            local data = ClientData.get(key)
+            local clonedData = table.clone(data)
+            ClientData.predict(key, action(clonedData))
+        end
+        local function getUniqueId()
+            return HttpService:GenerateGUID(false)
+        end
+        local function getSpawnerPetModel(kind)
+            if SC.petModels[kind] then return SC.petModels[kind] end
+            local streamed = load("DownloadClient").promise_download_copy("Pets", kind):expect()
+            SC.petModels[kind] = streamed
+            return streamed
+        end
+        local RARITY_ORDER = { legendary = 900000, ultra_rare = 700000, rare = 500000, uncommon = 300000, common = 100000 }
+        local rarityCounters = { legendary = 0, ultra_rare = 0, rare = 0, uncommon = 0, common = 0 }
+        local function getRarityNewness(kind)
+            local entry = InventoryDB.pets and InventoryDB.pets[kind]
+            local rarity = (entry and entry.rarity) or "common"
+            local base = RARITY_ORDER[rarity] or 100000
+            rarityCounters[rarity] = (rarityCounters[rarity] or 0) + 1
+            return base + 99999 - rarityCounters[rarity]
+        end
+        local function createPet(id, properties)
+            local uniqueId = getUniqueId()
+            local item = items[id]
+            if not item then return nil end
+            setthreadidentity(2)
+            local new_pet = {
+                unique = uniqueId, category = "pets", id = id, kind = item.kind,
+                newness_order = 0, properties = properties or {}
+            }
+            local inventory = ClientData.get("inventory")
+            inventory.pets[uniqueId] = new_pet
+            setthreadidentity(8)
+            SC.pets[uniqueId] = { data = new_pet, model = nil }
+            return new_pet
+        end
+        local function createToy(id)
+            local uniqueId = getUniqueId()
+            local item = items[id]
+            if not item then warn("Toy ID not found: "..id) return nil end
+            setthreadidentity(2)
+            local new_toy = {
+                unique = uniqueId, category = "toys", id = id, kind = item.kind,
+                newness_order = math.random(1, 900000), properties = {}
+            }
+            local inventory = ClientData.get("inventory")
+            inventory.toys[uniqueId] = new_toy
+            setthreadidentity(8)
+            return new_toy
+        end
+        local function neonify(model, entry)
+            local petModel = model:FindFirstChild("PetModel")
+            if not petModel then return end
+            for neonPart, configuration in pairs(entry.neon_parts) do
+                local trueNeonPart = petRigs.get(petModel).get_geo_part(petModel, neonPart)
+                trueNeonPart.Material = configuration.Material
+                trueNeonPart.Color = configuration.Color
+            end
+        end
+        local function addPetWrapper(wrapper)
+            updateData("pet_char_wrappers", function(petWrappers)
+                wrapper.unique = #petWrappers + 1
+                wrapper.index = #petWrappers + 1
+                petWrappers[#petWrappers + 1] = wrapper
+                return petWrappers
+            end)
+        end
+        local function addPetState(state)
+            updateData("pet_state_managers", function(petStates)
+                petStates[#petStates + 1] = state
+                return petStates
+            end)
+        end
+        local function findIndex(array, finder)
+            for index, value in pairs(array) do
+                if finder(value, index) then return index end
+            end
+            return nil
+        end
+        local function removePetWrapper(uniqueId)
+            updateData("pet_char_wrappers", function(petWrappers)
+                local index = findIndex(petWrappers, function(wrapper) return wrapper.pet_unique == uniqueId end)
+                if not index then return petWrappers end
+                table.remove(petWrappers, index)
+                for wrapperIndex, wrapper in pairs(petWrappers) do
+                    wrapper.unique = wrapperIndex
+                    wrapper.index = wrapperIndex
+                end
+                return petWrappers
+            end)
+        end
+        local function clearPetState(uniqueId)
+            local pet = SC.pets[uniqueId]
+            if not pet or not pet.model then return end
+            updateData("pet_state_managers", function(states)
+                local index = findIndex(states, function(state) return state.char == pet.model end)
+                if not index then return states end
+                local clonedStates = table.clone(states)
+                clonedStates[index] = table.clone(clonedStates[index])
+                clonedStates[index].states = {}
+                return clonedStates
+            end)
+        end
+        local function setPetState(uniqueId, id)
+            local pet = SC.pets[uniqueId]
+            if not pet or not pet.model then return end
+            updateData("pet_state_managers", function(states)
+                local index = findIndex(states, function(state) return state.char == pet.model end)
+                if not index then return states end
+                local clonedStates = table.clone(states)
+                clonedStates[index] = table.clone(clonedStates[index])
+                clonedStates[index].states = {{ id = id }}
+                return clonedStates
+            end)
+        end
+        local function attachPlayerToPet(pet)
+            local character = Players.LocalPlayer.Character
+            if not character or not character.PrimaryPart then return false end
+            local ridePosition = pet:FindFirstChild("RidePosition", true)
+            if not ridePosition then return false end
+            local sourceAttachment = Instance.new("Attachment")
+            sourceAttachment.Parent = ridePosition
+            sourceAttachment.Position = Vector3.new(0, 1.237, 0)
+            sourceAttachment.Name = "SourceAttachment"
+            local stateConnection = Instance.new("RigidConstraint")
+            stateConnection.Name = "StateConnection"
+            stateConnection.Attachment0 = sourceAttachment
+            stateConnection.Attachment1 = character.PrimaryPart.RootAttachment
+            stateConnection.Parent = character
+            return true
+        end
+        local function clearPlayerState()
+            updateData("state_manager", function(state)
+                local clonedState = table.clone(state)
+                clonedState.states = {}
+                clonedState.is_sitting = false
+                return clonedState
+            end)
+        end
+        local function setPlayerState(id)
+            updateData("state_manager", function(state)
+                local clonedState = table.clone(state)
+                clonedState.states = {{ id = id }}
+                clonedState.is_sitting = true
+                return clonedState
+            end)
+        end
+        local function removePetState(uniqueId)
+            local pet = SC.pets[uniqueId]
+            if not pet or not pet.model then return end
+            updateData("pet_state_managers", function(petStates)
+                local index = findIndex(petStates, function(state) return state.char == pet.model end)
+                if not index then return petStates end
+                table.remove(petStates, index)
+                return petStates
+            end)
+        end
+        local function unmount(uniqueId)
+            local pet = SC.pets[uniqueId]
+            if not pet or not pet.model then return end
+            if SC.currentMountTrack then
+                SC.currentMountTrack:Stop()
+                SC.currentMountTrack:Destroy()
+            end
+            local sourceAttachment = pet.model:FindFirstChild("SourceAttachment", true)
+            if sourceAttachment then sourceAttachment:Destroy() end
+            if Players.LocalPlayer.Character then
+                for _, descendant in pairs(Players.LocalPlayer.Character:GetDescendants()) do
+                    if descendant:IsA("BasePart") and descendant:GetAttribute("HaveMass") then
+                        descendant.Massless = false
+                    end
+                end
+            end
+            clearPetState(uniqueId)
+            clearPlayerState()
+            pet.model:ScaleTo(1)
+            SC.mountedPet = nil
+        end
+        local function mount(uniqueId, playerState, petState)
+            local pet = SC.pets[uniqueId]
+            if not pet or not pet.model then return end
+            local player = Players.LocalPlayer
+            if not player.Character or not player.Character.PrimaryPart then return end
+            SC.mountedPet = uniqueId
+            setPetState(uniqueId, petState)
+            setPlayerState(playerState)
+            pet.model:ScaleTo(2)
+            attachPlayerToPet(pet.model)
+            SC.currentMountTrack = player.Character.Humanoid.Animator:LoadAnimation(load("AnimationManager").get_track("PlayerRidingPet"))
+            player.Character.Humanoid.Sit = true
+            for _, descendant in pairs(player.Character:GetDescendants()) do
+                if descendant:IsA("BasePart") and descendant.Massless == false then
+                    descendant.Massless = true
+                    descendant:SetAttribute("HaveMass", true)
+                end
+            end
+            SC.currentMountTrack:Play()
+        end
+        local function fly(uniqueId) mount(uniqueId, "PlayerFlyingPet", "PetBeingFlown") end
+        local function ride(uniqueId) mount(uniqueId, "PlayerRidingPet", "PetBeingRidden") end
+        local function unequip(item)
+            local pet = SC.pets[item.unique]
+            if not pet or not pet.model then return end
+            unmount(item.unique)
+            removePetWrapper(item.unique)
+            removePetState(item.unique)
+            pet.model:Destroy()
+            pet.model = nil
+            SC.equippedPet = nil
+        end
+        local function equip(item)
+            if item.category == "pets" then
+                if SC.equippedPet then unequip(SC.equippedPet) end
+                local petModel = getSpawnerPetModel(item.kind):Clone()
+                petModel.Parent = workspace
+                SC.pets[item.unique].model = petModel
+                if item.properties.neon or item.properties.mega_neon then
+                    neonify(petModel, items[item.kind])
+                end
+                SC.equippedPet = item
+                addPetWrapper({
+                    char = petModel, mega_neon = item.properties.mega_neon, neon = item.properties.neon,
+                    player = Players.LocalPlayer, entity_controller = Players.LocalPlayer,
+                    controller = Players.LocalPlayer, rp_name = item.properties.rp_name or "",
+                    pet_trick_level = item.properties.pet_trick_level, pet_unique = item.unique,
+                    pet_id = item.id,
+                    location = { full_destination_id = "housing", destination_id = "housing", house_owner = Players.LocalPlayer },
+                    pet_progression = { age = math.random(1, 900000), percentage = math.random(0.01, 0.99) },
+                    are_colors_sealed = false, is_pet = true
+                })
+                addPetState({
+                    char = petModel, player = Players.LocalPlayer, store_key = "pet_state_managers",
+                    is_sitting = false, chars_connected_to_me = {}, states = {}
+                })
+            else
+                return oldGet("ToolAPI/Equip"):InvokeServer(item.unique)
+            end
+        end
+        local oldGet = load("RouterClient").get
+        local function createRemoteFunctionMock(callback)
+            return { InvokeServer = function(_, ...) return callback(...) end }
+        end
+        local function createRemoteEventMock(callback)
+            return { FireServer = function(_, ...) return callback(...) end }
+        end
+        local equipRemote = createRemoteFunctionMock(function(uniqueId, metadata)
+            local pet = SC.pets[uniqueId]
+            if pet then
+                equip(pet.data)
+                return true, { action = "equip", is_server = true }
+            end
+            return oldGet("ToolAPI/Equip"):InvokeServer(uniqueId, metadata)
+        end)
+        local unequipRemote = createRemoteFunctionMock(function(uniqueId)
+            local pet = SC.pets[uniqueId]
+            if pet then
+                unequip(pet.data)
+                return true, { action = "unequip", is_server = true }
+            end
+            return oldGet("ToolAPI/Unequip"):InvokeServer(uniqueId)
+        end)
+        local rideRemote    = createRemoteFunctionMock(function(item) ride(item.pet_unique) end)
+        local flyRemote     = createRemoteFunctionMock(function(item) fly(item.pet_unique) end)
+        local unmountRemoteFunction = createRemoteFunctionMock(function() unmount(SC.mountedPet) end)
+        local unmountRemoteEvent    = createRemoteEventMock(function() unmount(SC.mountedPet) end)
+        local RouterClient = load("RouterClient")
+        RouterClient.get = function(name)
+            if name == "ToolAPI/Equip"               then return equipRemote
+            elseif name == "ToolAPI/Unequip"         then return unequipRemote
+            elseif name == "AdoptAPI/RidePet"        then return rideRemote
+            elseif name == "AdoptAPI/FlyPet"         then return flyRemote
+            elseif name == "AdoptAPI/ExitSeatStatesYield" then return unmountRemoteFunction
+            elseif name == "AdoptAPI/ExitSeatStates" then return unmountRemoteEvent
+            end
+            return oldGet(name)
+        end
+        for _, charWrapper in pairs(ClientData.get("pet_char_wrappers")) do
+            oldGet("ToolAPI/Unequip"):InvokeServer(charWrapper.pet_unique)
+        end
+        local function GetPetByName(name)
+            for i,v in pairs(InventoryDB.pets) do
+                if v.name:lower() == name:lower() then return v.id end
+            end
+            return false
+        end
+        local function GetToyByName(name)
+            for i,v in pairs(InventoryDB.toys) do
+                if v.name:lower() == name:lower() then return v.id end
+            end
+            return false
+        end
+        -- ── Spawner UI ──────────────────────────────────────────────────
+        local spawnerLayout = Instance.new('UIListLayout')
+        spawnerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        spawnerLayout.Padding = UDim.new(0, 4)
+        spawnerLayout.Parent = spawnFrame
+        local spawnerPadding = Instance.new('UIPadding')
+        spawnerPadding.PaddingTop = UDim.new(0, 4)
+        spawnerPadding.PaddingLeft = UDim.new(0, 4)
+        spawnerPadding.PaddingRight = UDim.new(0, 4)
+        spawnerPadding.Parent = spawnFrame
+        local subTabFrame = Instance.new("Frame")
+        subTabFrame.Size = UDim2.new(1, 0, 0, 30)
+        subTabFrame.BackgroundTransparency = 1
+        subTabFrame.LayoutOrder = 1
+        subTabFrame.Parent = spawnFrame
+        local petTab = Instance.new("TextButton")
+        petTab.Size = UDim2.new(0.49, 0, 1, 0)
+        petTab.Position = UDim2.new(0, 0, 0, 0)
+        petTab.Text = "Pets"
+        petTab.BackgroundColor3 = Color3.fromRGB(40,40,50)
+        petTab.BackgroundTransparency = 0.1
+        petTab.Font = Enum.Font.FredokaOne
+        petTab.TextColor3 = Color3.fromRGB(255, 255, 255)
+        petTab.TextSize = 16
+        petTab.Parent = subTabFrame
+        Instance.new("UICorner", petTab).CornerRadius = UDim.new(0, 6)
+        do
+            local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(108,75,171); s.Thickness = 1.5; s.Transparency = 0.3; s.Parent = petTab
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.5; ts.Parent = petTab
+        end
+        local toyTab = Instance.new("TextButton")
+        toyTab.Size = UDim2.new(0.49, 0, 1, 0)
+        toyTab.Position = UDim2.new(0.51, 0, 0, 0)
+        toyTab.Text = "Toys"
+        toyTab.BackgroundColor3 = Color3.fromRGB(30,30,40)
+        toyTab.BackgroundTransparency = 0.1
+        toyTab.Font = Enum.Font.FredokaOne
+        toyTab.TextColor3 = Color3.fromRGB(255, 255, 255)
+        toyTab.TextSize = 16
+        toyTab.Parent = subTabFrame
+        Instance.new("UICorner", toyTab).CornerRadius = UDim.new(0, 6)
+        do
+            local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(108,75,171); s.Thickness = 1.5; s.Transparency = 0.3; s.Parent = toyTab
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.5; ts.Parent = toyTab
+        end
+        local petContent = Instance.new("Frame")
+        petContent.Size = UDim2.new(1, 0, 0, 500)
+        petContent.BackgroundTransparency = 1
+        petContent.Visible = true
+        petContent.LayoutOrder = 2
+        petContent.Parent = spawnFrame
+        local toyContent = Instance.new("Frame")
+        toyContent.Size = UDim2.new(1, 0, 0, 200)
+        toyContent.BackgroundTransparency = 1
+        toyContent.Visible = false
+        toyContent.LayoutOrder = 3
+        toyContent.Parent = spawnFrame
+        petTab.MouseButton1Click:Connect(function()
+            petContent.Visible = true
+            toyContent.Visible = false
+            petTab.BackgroundColor3 = Color3.fromRGB(40,40,50)
+            toyTab.BackgroundColor3 = Color3.fromRGB(30,30,40)
+        end)
+        toyTab.MouseButton1Click:Connect(function()
+            petContent.Visible = false
+            toyContent.Visible = true
+            petTab.BackgroundColor3 = Color3.fromRGB(30,30,40)
+            toyTab.BackgroundColor3 = Color3.fromRGB(40,40,50)
+        end)
+        -- Pet name input
+        local petNameBox = Instance.new("TextBox")
+        petNameBox.Size = UDim2.new(0.85, 0, 0, 28)
+        petNameBox.Position = UDim2.new(0.075, 0, 0, 10)
+        petNameBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+        petNameBox.BackgroundTransparency = 0.2
+        petNameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        petNameBox.TextSize = 14
+        petNameBox.Font = Enum.Font.FredokaOne
+        petNameBox.PlaceholderText = "Enter Pet Name to Spawn"
+        petNameBox.Text = ""
+        petNameBox.ClearTextOnFocus = false
+        petNameBox.Parent = petContent
+        Instance.new("UICorner", petNameBox).CornerRadius = UDim.new(0, 6)
+        do
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = petNameBox
+        end
+        local boxGlow = Instance.new("UIStroke")
+        boxGlow.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        boxGlow.Color = Color3.fromRGB(255, 255, 255)
+        boxGlow.Thickness = 2.2
+        boxGlow.Transparency = 0.25
+        boxGlow.Parent = petNameBox
+        local validPetNames = {}
+        local validPetNamesClean = {}
+        do
+            for id, item in pairs(InventoryDB.pets) do
+                validPetNames[#validPetNames + 1] = item.name
+                validPetNamesClean[#validPetNamesClean + 1] = item.name:lower():gsub("%s+", "")
+            end
+        end
+        local currentColorTween = nil
+        local lastCursorPosition = 1
+        local function capitalizeWords(str)
+            local result = ""
+            local i = 1
+            local n = #str
+            while i <= n do
+                if str:sub(i, i):match("%S") then
+                    local wordStart = i
+                    while i <= n and str:sub(i, i):match("%S") do i = i + 1 end
+                    local word = str:sub(wordStart, i-1)
+                    if #word > 0 then word = word:sub(1,1):upper()..word:sub(2):lower() end
+                    result = result..word
+                else
+                    result = result..str:sub(i, i)
+                    i = i + 1
+                end
+            end
+            return result
+        end
+        local function setGlowColor(targetColor)
+            if currentColorTween then currentColorTween:Cancel() end
+            currentColorTween = TweenService:Create(boxGlow, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Color = targetColor})
+            currentColorTween:Play()
+        end
+        petNameBox:GetPropertyChangedSignal("Text"):Connect(function()
+            lastCursorPosition = petNameBox.CursorPosition
+            local inputText = petNameBox.Text
+            local newText = capitalizeWords(inputText)
+            if newText ~= inputText then
+                petNameBox.Text = newText
+                local addedChars = #newText - #inputText
+                petNameBox.CursorPosition = math.max(1, math.min(lastCursorPosition + addedChars, #newText + 1))
+                return
+            end
+            local displayedText = petNameBox.Text
+            local cleanName = displayedText:lower():gsub("%s+", "")
+            local isExactMatch = false
+            local isCleanMatch = false
+            for _, name in ipairs(validPetNames) do
+                if name:lower() == displayedText:lower() then isExactMatch = true break end
+            end
+            isCleanMatch = table.find(validPetNamesClean, cleanName) ~= nil
+            local targetColor
+            if displayedText == ""          then targetColor = SpawnerState.COLORS.NEUTRAL
+            elseif isExactMatch or isCleanMatch then targetColor = SpawnerState.COLORS.VALID
+            else                                 targetColor = SpawnerState.COLORS.INVALID end
+            setGlowColor(targetColor)
+        end)
+        setGlowColor(SpawnerState.COLORS.NEUTRAL)
+        -- F / R / N / M toggle buttons
+        local prefixes = {"F", "R", "N", "M"}
+        local toggleButtonWidth = 0.18
+        local toggleSpacing = 0.07
+        local toggleTotalWidth = #prefixes * toggleButtonWidth + (#prefixes - 1) * toggleSpacing
+        local toggleStartX = (1 - toggleTotalWidth) / 2
+        for i, prefix in ipairs(prefixes) do
+            local prefixButton = Instance.new("TextButton")
+            prefixButton.Size = UDim2.new(toggleButtonWidth, 0, 0, 25)
+            prefixButton.Position = UDim2.new(toggleStartX + (toggleButtonWidth + toggleSpacing) * (i - 1), 0, 0, 50)
+            prefixButton.Text = prefix
+            prefixButton.BackgroundColor3 = Color3.fromRGB(35,35,48)
+            prefixButton.BackgroundTransparency = 0.2
+            prefixButton.Font = Enum.Font.FredokaOne
+            prefixButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+            prefixButton.TextSize = 16
+            prefixButton.Parent = petContent
+            Instance.new("UICorner", prefixButton).CornerRadius = UDim.new(0, 6)
+            local btnStroke = Instance.new("UIStroke")
+            btnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            btnStroke.Color = SpawnerState.baseColors[prefix]
+            btnStroke.Thickness = 2
+            btnStroke.Transparency = 0.5
+            btnStroke.Parent = prefixButton
+            local btnTextStroke = Instance.new("UIStroke")
+            btnTextStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            btnTextStroke.Color = Color3.new(0, 0, 0)
+            btnTextStroke.Thickness = 1.5
+            btnTextStroke.Transparency = 0
+            btnTextStroke.Parent = prefixButton
+            local origStroke = { Color = SpawnerState.baseColors[prefix], Thickness = 2, Transparency = 0.5 }
+            prefixButton.MouseButton1Click:Connect(function()
+                if prefix == "M" and SpawnerState.activeFlags["N"] then return end
+                if prefix == "N" and SpawnerState.activeFlags["M"] then return end
+                SpawnerState.activeFlags[prefix] = not SpawnerState.activeFlags[prefix]
+                if SpawnerState.activeFlags[prefix] then
+                    prefixButton.BackgroundColor3 = Color3.fromRGB(55,45,75)
+                    TweenService:Create(btnStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+                        Color = Color3.fromRGB(0, 255, 0), Thickness = 3, Transparency = 0.2
+                    }):Play()
+                else
+                    prefixButton.BackgroundColor3 = Color3.fromRGB(35,35,48)
+                    TweenService:Create(btnStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+                        Color = origStroke.Color, Thickness = origStroke.Thickness, Transparency = origStroke.Transparency
+                    }):Play()
+                end
+                updateInfoBox(SpawnerState.activeFlags)
+            end)
+        end
+        -- Info box (shows active flags)
+        local infoBox = Instance.new("Frame")
+        infoBox.Name = "InfoBox"
+        infoBox.Size = UDim2.new(0.85, 0, 0, 30)
+        infoBox.Position = UDim2.new(0.075, 0, 0, 90)
+        infoBox.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        infoBox.BackgroundTransparency = 0.5
+        infoBox.BorderSizePixel = 0
+        infoBox.Parent = petContent
+        Instance.new("UICorner", infoBox).CornerRadius = UDim.new(0, 8)
+        local infoBoxStroke = Instance.new("UIStroke")
+        infoBoxStroke.Color = Color3.fromRGB(255, 255, 255)
+        infoBoxStroke.Thickness = 1.2
+        infoBoxStroke.Transparency = 0.7
+        infoBoxStroke.Parent = infoBox
+        local infoTextContainer = Instance.new("Frame")
+        infoTextContainer.Name = "TextContainer"
+        infoTextContainer.Size = UDim2.new(1, 0, 1, 0)
+        infoTextContainer.BackgroundTransparency = 1
+        infoTextContainer.Parent = infoBox
+        local infoLayout = Instance.new("UIListLayout")
+        infoLayout.FillDirection = Enum.FillDirection.Horizontal
+        infoLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        infoLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+        infoLayout.Padding = UDim.new(0, 4)
+        infoLayout.Parent = infoTextContainer
+        local animationSystem = { pulsePhase = 0, pulseSpeed = 2, baseThickness = 1.2, maxThickness = 3, activeColors = nil, active = false }
+        local function updateAnimation(dt)
+            if not animationSystem.active then return end
+            animationSystem.pulsePhase = animationSystem.pulsePhase + dt * animationSystem.pulseSpeed
+            local pulse = (math.sin(animationSystem.pulsePhase) + 1) * 0.5
+            infoBoxStroke.Thickness = animationSystem.baseThickness + (animationSystem.maxThickness - animationSystem.baseThickness) * pulse
+            infoBoxStroke.Transparency = 0.7 - (0.5 * pulse)
+            if animationSystem.activeColors then
+                local brightness = 0.8 + (0.4 * pulse)
+                local r, g, b = 0, 0, 0
+                for _, color in ipairs(animationSystem.activeColors) do
+                    r = r + (color.R * brightness); g = g + (color.G * brightness); b = b + (color.B * brightness)
+                end
+                infoBoxStroke.Color = Color3.new(
+                    math.min(r / #animationSystem.activeColors, 1),
+                    math.min(g / #animationSystem.activeColors, 1),
+                    math.min(b / #animationSystem.activeColors, 1)
+                )
+            end
+        end
+        local function createTextLabel(text, color)
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(0, 0, 1, 0)
+            label.AutomaticSize = Enum.AutomaticSize.X
+            label.BackgroundTransparency = 1
+            label.Text = text
+            label.Font = Enum.Font.FredokaOne
+            label.TextSize = 16
+            label.TextColor3 = color
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.TextYAlignment = Enum.TextYAlignment.Center
+            if text == "Mega Neon" then
+                label.Text = "Mega Neon"
+            elseif text ~= "Ride" and text ~= "Neon" and text ~= "Fly" then
+                label.Text = label.Text .. " "
+            end
+            return label
+        end
+        function updateInfoBox(activeFlags)
+            for _, child in ipairs(infoTextContainer:GetChildren()) do
+                if child:IsA("TextLabel") then child:Destroy() end
+            end
+            local activeColors = {}
+            local hasFlags = false
+            local labels = {}
+            if activeFlags["M"] then table.insert(labels, {"Mega Neon", SpawnerState.baseColors.M}); table.insert(activeColors, SpawnerState.baseColors.M); hasFlags = true end
+            if activeFlags["N"] then table.insert(labels, {"Neon",      SpawnerState.baseColors.N}); table.insert(activeColors, SpawnerState.baseColors.N); hasFlags = true end
+            if activeFlags["F"] then table.insert(labels, {"Fly",       SpawnerState.baseColors.F}); table.insert(activeColors, SpawnerState.baseColors.F); hasFlags = true end
+            if activeFlags["R"] then table.insert(labels, {"Ride",      SpawnerState.baseColors.R}); table.insert(activeColors, SpawnerState.baseColors.R); hasFlags = true end
+            for _, labelData in ipairs(labels) do createTextLabel(labelData[1], labelData[2]).Parent = infoTextContainer end
+            if hasFlags then
+                animationSystem.active = true
+                animationSystem.activeColors = activeColors
+            else
+                animationSystem.active = false
+                createTextLabel("Normal", Color3.fromRGB(255, 255, 255)).Parent = infoTextContainer
+                infoBoxStroke.Color = Color3.fromRGB(255, 255, 255)
+                infoBoxStroke.Thickness = animationSystem.baseThickness
+                infoBoxStroke.Transparency = 0.7
+            end
+        end
+        RunService.Heartbeat:Connect(updateAnimation)
+        updateInfoBox({F = false, R = false, N = false, M = false})
+        -- High Tier pets list
+        local highTierPets = {
+            "Shadow Dragon", "Bat Dragon", "Frost Dragon", "Giraffe", "Owl", "Parrot",
+            "Crow", "Evil Unicorn", "Arctic Reindeer", "Hedgehog", "Dalmatian", "Turtle",
+            "Kangaroo", "Lion", "Cupid Dragon", "Undead Jousting Horse", "Diamond Amazon",
+            "Glacier Moth", "Midnight Dragon", "Cabbit", "Sakura Spirit", "Arctic Dusk Dragon",
+            "Elephant", "Dango Penguins", "Cryptid", "Jekyll Hydra", "Chocolate Chip Bat Dragon",
+            "Cow", "Mermicorn", "Vampire Dragon", "Christmas Pudding Pup", "Blazing Lion",
+            "African Wild Dog", "Flamingo", "Diamond Butterfly", "Mini Pig", "Caterpillar",
+            "Albino Monkey", "Candyfloss Chick", "Pelican", "Blue Dog", "Pink Cat", "Haetae",
+            "Peppermint Penguin", "Winged Tiger", "Sugar Glider", "Shark Puppy", "Goat",
+            "Sheeeeep", "Frost Fury", "Lion Cub", "Nessie", "Frostbite Bear",
+            "Balloon Unicorn", "Honey Badger", "Hot Doggo", "Crocodile", "Hare", "Ram", "Yeti",
+            "Lava Dragon", "Meerkat", "Jellyfish", "Happy Clam", "Orchid Butterfly",
+            "Many Mackerel", "Strawberry Shortcake Bat Dragon", "Zombie Buffalo",
+            "Fairy Bat Dragon", "Giant Panda", "Pirate Ghost Capuchin Monkey",
+            "Dragonfruit Fox", "Rose Dragon", "Silverback Gorilla", "Velocirooster", "Pineapple Owl",
+        }
+        -- Spawn High Tier button
+        local highTierButton = Instance.new("TextButton")
+        highTierButton.Size = UDim2.new(0.6, 0, 0, 25)
+        highTierButton.Position = UDim2.new(0.2, 0, 0, 135)
+        highTierButton.Text = "Spawn High Tier"
+        highTierButton.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        highTierButton.BackgroundTransparency = 0.1
+        highTierButton.Font = Enum.Font.FredokaOne
+        highTierButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        highTierButton.TextSize = 16
+        highTierButton.Parent = petContent
+        Instance.new("UICorner", highTierButton).CornerRadius = UDim.new(0, 8)
+        local highTierStroke = Instance.new("UIStroke")
+        highTierStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        highTierStroke.Color = Color3.fromRGB(108,75,171)
+        highTierStroke.Thickness = 1.5
+        highTierStroke.Transparency = 0.1
+        highTierStroke.Parent = highTierButton
+        do
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.5; ts.Parent = highTierButton
+        end
+        local highTierOriginalProperties = {
+            BackgroundColor3 = highTierButton.BackgroundColor3,
+            StrokeColor = Color3.fromRGB(108,75,171),
+            StrokeThickness = 1.5,
+            StrokeTransparency = 0.3
+        }
+        local highTierActiveAnimation = { endTime = 0, strokeTween = nil, resetThread = nil, intensity = 1.0 }
+        highTierButton.MouseEnter:Connect(function()
+            if highTierActiveAnimation.endTime < os.clock() then
+                highTierButton.BackgroundColor3 = Color3.fromRGB(50,45,65)
+                TweenService:Create(highTierStroke, TweenInfo.new(0.2), { Thickness = 2, Transparency = 0.05 }):Play()
+            end
+        end)
+        highTierButton.MouseLeave:Connect(function()
+            if highTierActiveAnimation.endTime < os.clock() then
+                highTierButton.BackgroundColor3 = highTierOriginalProperties.BackgroundColor3
+                TweenService:Create(highTierStroke, TweenInfo.new(0.2), { Thickness = highTierOriginalProperties.StrokeThickness, Transparency = highTierOriginalProperties.StrokeTransparency }):Play()
+            end
+        end)
+        highTierButton.MouseButton1Click:Connect(function()
+            local currentTime = os.clock()
+            local extendDuration = 1.5
+            local isExtension = currentTime < highTierActiveAnimation.endTime
+            if isExtension then
+                highTierActiveAnimation.intensity = math.min(highTierActiveAnimation.intensity + 0.3, 1.5)
+            else
+                highTierActiveAnimation.intensity = 1.0
+            end
+            if highTierActiveAnimation.strokeTween then highTierActiveAnimation.strokeTween:Cancel() end
+            if highTierActiveAnimation.resetThread then coroutine.close(highTierActiveAnimation.resetThread) end
+            local feedbackColor = Color3.fromRGB(255, 50, 50)
+            local spawnSuccess = false
+            for _, petName in ipairs(highTierPets) do
+                local petId = GetPetByName(petName)
+                if petId then
+                    local props = {
+                        pet_trick_level = math.random(1, 5),
+                        mega_neon = SpawnerState.activeFlags['M'] or nil,
+                        neon = (not SpawnerState.activeFlags['M'] and SpawnerState.activeFlags['N']) or nil,
+                        rideable = SpawnerState.activeFlags['R'],
+                        flyable = SpawnerState.activeFlags['F'],
+                        age = math.random(1, 900000),
+                        ailments_completed = 0,
+                        rp_name = ""
+                    }
+                    if not SpawnerState.activeFlags['M'] and not SpawnerState.activeFlags['N'] then
+                        props.neon = false; props.mega_neon = false
+                    end
+                    createPet(petId, props)
+                    spawnSuccess = true
+                end
+            end
+            if spawnSuccess then
+                feedbackColor = Color3.fromRGB(0, 255 * highTierActiveAnimation.intensity, 0)
+                game.StarterGui:SetCore("SendNotification", { Title = "High Tier Pets Spawned!", Text = "All high tier pets have been spawned!", Duration = 5 })
+            else
+                game.StarterGui:SetCore("SendNotification", { Title = "Error", Text = "Failed to spawn high tier pets!", Duration = 3 })
+            end
+            highTierStroke.Color = feedbackColor
+            highTierStroke.Thickness = 2 * highTierActiveAnimation.intensity
+            highTierStroke.Transparency = 0.1 / highTierActiveAnimation.intensity
+            if isExtension then
+                highTierActiveAnimation.strokeTween = TweenService:Create(highTierStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Thickness = 2.5 * highTierActiveAnimation.intensity, Transparency = 0.05 / highTierActiveAnimation.intensity })
+                highTierActiveAnimation.strokeTween:Play()
+            end
+            highTierActiveAnimation.endTime = currentTime + extendDuration
+            highTierActiveAnimation.resetThread = task.delay(extendDuration, function()
+                if os.clock() >= highTierActiveAnimation.endTime then
+                    TweenService:Create(highTierStroke, TweenInfo.new(0.5, Enum.EasingStyle.Quad), { Color = highTierOriginalProperties.StrokeColor, Thickness = highTierOriginalProperties.StrokeThickness, Transparency = highTierOriginalProperties.StrokeTransparency }):Play()
+                end
+            end)
+        end)
+        -- Spawn Pet button
+        local startButton = Instance.new("TextButton")
+        startButton.Size = UDim2.new(0.6, 0, 0, 25)
+        startButton.Position = UDim2.new(0.2, 0, 0, 175)
+        startButton.Text = "Spawn Pet"
+        startButton.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        startButton.BackgroundTransparency = 0.1
+        startButton.Font = Enum.Font.FredokaOne
+        startButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        startButton.TextSize = 16
+        startButton.Parent = petContent
+        Instance.new("UICorner", startButton).CornerRadius = UDim.new(0, 8)
+        local buttonStroke = Instance.new("UIStroke")
+        buttonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        buttonStroke.Color = Color3.fromRGB(108,75,171)
+        buttonStroke.Thickness = 1.5
+        buttonStroke.Transparency = 0.1
+        buttonStroke.Parent = startButton
+        do
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.5; ts.Parent = startButton
+        end
+        local originalProperties = {
+            BackgroundColor3 = startButton.BackgroundColor3,
+            StrokeColor = Color3.fromRGB(108,75,171),
+            StrokeThickness = 1.5,
+            StrokeTransparency = 0.3
+        }
+        local activeAnimation = { endTime = 0, strokeTween = nil, resetThread = nil, intensity = 1.0, lastSuccess = false }
+        startButton.MouseEnter:Connect(function()
+            if activeAnimation.endTime < os.clock() then
+                startButton.BackgroundColor3 = Color3.fromRGB(50,45,65)
+                TweenService:Create(buttonStroke, TweenInfo.new(0.2), { Thickness = 2, Transparency = 0.05 }):Play()
+            end
+        end)
+        startButton.MouseLeave:Connect(function()
+            if activeAnimation.endTime < os.clock() then
+                startButton.BackgroundColor3 = originalProperties.BackgroundColor3
+                TweenService:Create(buttonStroke, TweenInfo.new(0.2), { Thickness = originalProperties.StrokeThickness, Transparency = originalProperties.StrokeTransparency }):Play()
+            end
+        end)
+        startButton.MouseButton1Click:Connect(function()
+            local pet_name = petNameBox.Text
+            local currentTime = os.clock()
+            local extendDuration = 1.5
+            local isExtension = currentTime < activeAnimation.endTime
+            if isExtension then
+                activeAnimation.intensity = math.min(activeAnimation.intensity + 0.3, 1.5)
+            else
+                activeAnimation.intensity = 1.0
+            end
+            if activeAnimation.strokeTween then activeAnimation.strokeTween:Cancel() end
+            if activeAnimation.resetThread then coroutine.close(activeAnimation.resetThread) end
+            local feedbackColor = Color3.fromRGB(255, 50, 50)
+            local spawnSuccess = false
+            if pet_name ~= "" then
+                local petId = GetPetByName(pet_name)
+                if petId then
+                    local props = {
+                        pet_trick_level = math.random(1, 5),
+                        mega_neon = SpawnerState.activeFlags['M'] or nil,
+                        neon = (not SpawnerState.activeFlags['M'] and SpawnerState.activeFlags['N']) or nil,
+                        rideable = SpawnerState.activeFlags['R'],
+                        flyable = SpawnerState.activeFlags['F'],
+                        age = math.random(1, 900000),
+                        ailments_completed = 0,
+                        rp_name = ""
+                    }
+                    if not SpawnerState.activeFlags['M'] and not SpawnerState.activeFlags['N'] then
+                        props.neon = false; props.mega_neon = false
+                    end
+                    createPet(petId, props)
+                    spawnSuccess = true
+                    game.StarterGui:SetCore("SendNotification", { Title = "Pet Spawned!", Text = pet_name .. " has been spawned!", Duration = 5 })
+                else
+                    game.StarterGui:SetCore("SendNotification", { Title = "Error", Text = "Pet not found: "..pet_name, Duration = 3 })
+                end
+            else
+                game.StarterGui:SetCore("SendNotification", { Title = "Error", Text = "Please enter a pet name!", Duration = 3 })
+            end
+            activeAnimation.lastSuccess = spawnSuccess
+            if isExtension and activeAnimation.lastSuccess then
+                feedbackColor = Color3.fromRGB(0, 255 * activeAnimation.intensity, 0)
+            end
+            buttonStroke.Color = feedbackColor
+            buttonStroke.Thickness = 2 * activeAnimation.intensity
+            buttonStroke.Transparency = 0.1 / activeAnimation.intensity
+            if isExtension then
+                activeAnimation.strokeTween = TweenService:Create(buttonStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Thickness = 2.5 * activeAnimation.intensity, Transparency = 0.05 / activeAnimation.intensity })
+                activeAnimation.strokeTween:Play()
+            end
+            activeAnimation.endTime = currentTime + extendDuration
+            activeAnimation.resetThread = task.delay(extendDuration, function()
+                if os.clock() >= activeAnimation.endTime then
+                    TweenService:Create(buttonStroke, TweenInfo.new(0.5, Enum.EasingStyle.Quad), { Color = originalProperties.StrokeColor, Thickness = originalProperties.StrokeThickness, Transparency = originalProperties.StrokeTransparency }):Play()
+                end
+            end)
+        end)
+
+        -- ────────────────────────────────────────
+        --  PET WEAR (PEWTER) SECTION
+        -- ────────────────────────────────────────
+        local function GetPetWearByName(name)
+            local IDB2 = require(game.ReplicatedStorage.Fsys).load("InventoryDB")
+            for id, v in pairs(IDB2.pet_accessories or {}) do
+                if v.name and v.name:lower() == name:lower() then return id end
+            end
+            return false
+        end
+
+        local function equipWearOnPet(wearId)
+            local IDB2    = require(game.ReplicatedStorage.Fsys).load("InventoryDB")
+            local PAEquip = require(game.ReplicatedStorage.Fsys).load("PetAccessoryEquipHelper")
+            local dl      = require(game.ReplicatedStorage.Fsys).load("DownloadClient")
+
+            local wearEntry = IDB2.pet_accessories and IDB2.pet_accessories[wearId]
+            if not wearEntry then
+                game.StarterGui:SetCore("SendNotification", {Title="Not Found", Text="Wear entry missing from DB.", Duration=4})
+                return false
+            end
+
+            local wrappers = ClientData.get("pet_char_wrappers")
+            if not wrappers or #wrappers == 0 then
+                game.StarterGui:SetCore("SendNotification", {Title="No Pet Equipped", Text="Equip a pet first!", Duration=4})
+                return false
+            end
+
+            local petModel = wrappers[#wrappers].char
+            if not petModel or not petModel:IsDescendantOf(workspace) then
+                game.StarterGui:SetCore("SendNotification", {Title="Pet Not Found", Text="Could not find pet model in workspace.", Duration=4})
+                return false
+            end
+
+            task.spawn(function()
+                local ok, accessoryAsset = pcall(function()
+                    return dl.promise_download_copy("PetAvatarResources", wearEntry.model_handle):expect()
+                end)
+                if not ok or not accessoryAsset then
+                    game.StarterGui:SetCore("SendNotification", {Title="Download Failed", Text="Could not load accessory model.", Duration=4})
+                    return
+                end
+                local success, result = pcall(function()
+                    return PAEquip.equip_accessory({
+                        pet_model            = petModel,
+                        accessory_base_asset = accessoryAsset,
+                        accessory_item_entry = wearEntry,
+                        play_poof_effect     = true,
+                        is_mannequin         = false,
+                    })
+                end)
+                if success and result then
+                    game.StarterGui:SetCore("SendNotification", {Title="🪽 Equipped!", Text=(wearEntry.name or wearId).." equipped on your pet.", Duration=4})
+                else
+                    game.StarterGui:SetCore("SendNotification", {Title="Equip Failed", Text="Check console for error.", Duration=4})
+                end
+            end)
+            return true
+        end
+
+        -- Pet Wear name input
+        local petWearNameBox = Instance.new("TextBox")
+        petWearNameBox.Size = UDim2.new(0.85, 0, 0, 26)
+        petWearNameBox.Position = UDim2.new(0.075, 0, 0, 210)
+        petWearNameBox.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+        petWearNameBox.BackgroundTransparency = 0.2
+        petWearNameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        petWearNameBox.TextSize = 13
+        petWearNameBox.Font = Enum.Font.FredokaOne
+        petWearNameBox.PlaceholderText = "Enter Pet Wear Name"
+        petWearNameBox.Text = ""
+        petWearNameBox.ClearTextOnFocus = false
+        petWearNameBox.Parent = petContent
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,6); c.Parent = petWearNameBox
+            local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            s.Color = Color3.fromRGB(220,180,255); s.Thickness = 1.8; s.Transparency = 0.25; s.Parent = petWearNameBox
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = petWearNameBox
+        end
+        petWearNameBox:GetPropertyChangedSignal("Text"):Connect(function()
+            local cursor = petWearNameBox.CursorPosition
+            local inputText = petWearNameBox.Text
+            local newText = capitalizeWords(inputText)
+            if newText ~= inputText then
+                petWearNameBox.Text = newText
+                petWearNameBox.CursorPosition = math.max(1, math.min(cursor + (#newText - #inputText), #newText + 1))
+            end
+        end)
+
+        -- Add PetWear button
+        local addPetWearBtn = Instance.new("TextButton")
+        addPetWearBtn.Size = UDim2.new(0.85, 0, 0, 26)
+        addPetWearBtn.Position = UDim2.new(0.075, 0, 0, 240)
+        addPetWearBtn.Text = "✦ Add PetWear"
+        addPetWearBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        addPetWearBtn.BackgroundTransparency = 0.1
+        addPetWearBtn.Font = Enum.Font.FredokaOne
+        addPetWearBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        addPetWearBtn.TextSize = 13
+        addPetWearBtn.Parent = petContent
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,8); c.Parent = addPetWearBtn
+            local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            s.Color = Color3.fromRGB(108,75,171); s.Thickness = 1.5; s.Transparency = 0.3; s.Parent = addPetWearBtn
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = addPetWearBtn
+        end
+        addPetWearBtn.MouseEnter:Connect(function()
+            TweenService:Create(addPetWearBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(50,45,65)}):Play()
+        end)
+        addPetWearBtn.MouseLeave:Connect(function()
+            TweenService:Create(addPetWearBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(35,35,48)}):Play()
+        end)
+        addPetWearBtn.MouseButton1Click:Connect(function()
+            local wearName = petWearNameBox.Text
+            if wearName == "" then
+                game.StarterGui:SetCore("SendNotification", {Title="Error", Text="Enter a pet wear name!", Duration=3})
+                return
+            end
+            local wearId = GetPetWearByName(wearName)
+            if wearId then
+                equipWearOnPet(wearId)
+            else
+                game.StarterGui:SetCore("SendNotification", {Title="Not Found", Text='"' .. wearName .. '" not found.', Duration=5})
+            end
+        end)
+
+        -- Preppy PetWear button
+        local PREPPY_WEARS_SPAWN = { "Unicorn Horn", "Pink Cat Ear Headphones", "Rainbow Maker", "2022 Birthday Cupcake Shoes" }
+        local preppyPWSpawnBtn = Instance.new("TextButton")
+        preppyPWSpawnBtn.Size = UDim2.new(0.85, 0, 0, 26)
+        preppyPWSpawnBtn.Position = UDim2.new(0.075, 0, 0, 270)
+        preppyPWSpawnBtn.Text = "🎀 Add Preppy PW"
+        preppyPWSpawnBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        preppyPWSpawnBtn.BackgroundTransparency = 0.1
+        preppyPWSpawnBtn.Font = Enum.Font.FredokaOne
+        preppyPWSpawnBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        preppyPWSpawnBtn.TextSize = 13
+        preppyPWSpawnBtn.Parent = petContent
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,8); c.Parent = preppyPWSpawnBtn
+            local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            s.Color = Color3.fromRGB(108,75,171); s.Thickness = 1.5; s.Transparency = 0.3; s.Parent = preppyPWSpawnBtn
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = preppyPWSpawnBtn
+        end
+        preppyPWSpawnBtn.MouseEnter:Connect(function()
+            TweenService:Create(preppyPWSpawnBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(50,45,65)}):Play()
+        end)
+        preppyPWSpawnBtn.MouseLeave:Connect(function()
+            TweenService:Create(preppyPWSpawnBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(35,35,48)}):Play()
+        end)
+        preppyPWSpawnBtn.MouseButton1Click:Connect(function()
+            local added, missed = {}, {}
+            for _, wearName in ipairs(PREPPY_WEARS_SPAWN) do
+                local wearId = GetPetWearByName(wearName)
+                if wearId then equipWearOnPet(wearId); table.insert(added, wearName)
+                else table.insert(missed, wearName) end
+            end
+            if #added > 0 then
+                game.StarterGui:SetCore("SendNotification", {
+                    Title = "🎀 Preppy PW Equipped!",
+                    Text  = #added.." wears equipped"..(#missed > 0 and " ("..(#missed).." not found)" or "")..".",
+                    Duration = 5,
+                })
+            else
+                game.StarterGui:SetCore("SendNotification", {Title="None Found", Text="No preppy wears found.", Duration=4})
+            end
+        end)
+
+        -- ────────────────────────────────────────
+        --  PET BODY COLOUR SECTION
+        -- ────────────────────────────────────────
+        local petColourBox = Instance.new("TextBox")
+        petColourBox.Size = UDim2.new(0.85, 0, 0, 26)
+        petColourBox.Position = UDim2.new(0.075, 0, 0, 300)
+        petColourBox.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+        petColourBox.BackgroundTransparency = 0.2
+        petColourBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        petColourBox.TextSize = 13
+        petColourBox.Font = Enum.Font.FredokaOne
+        petColourBox.PlaceholderText = "Hex colour e.g. FF90C8"
+        petColourBox.Text = ""
+        petColourBox.ClearTextOnFocus = false
+        petColourBox.Parent = petContent
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,6); c.Parent = petColourBox
+            local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            s.Color = Color3.fromRGB(255, 180, 220); s.Thickness = 1.8; s.Transparency = 0.25; s.Parent = petColourBox
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = petColourBox
+        end
+
+        local function hexToColor3Spawn(hex)
+            hex = hex:gsub("^#", ""):gsub("%s+", "")
+            if #hex ~= 6 then return nil end
+            local r = tonumber(hex:sub(1,2), 16)
+            local g = tonumber(hex:sub(3,4), 16)
+            local b = tonumber(hex:sub(5,6), 16)
+            if not r or not g or not b then return nil end
+            return Color3.fromRGB(r, g, b)
+        end
+
+        local colourBoxGlowSpawn = petColourBox:FindFirstChildWhichIsA("UIStroke")
+        petColourBox:GetPropertyChangedSignal("Text"):Connect(function()
+            local col = hexToColor3Spawn(petColourBox.Text)
+            local targetColor = col and Color3.fromRGB(120, 255, 150) or
+                (petColourBox.Text == "" and Color3.fromRGB(255, 180, 220) or Color3.fromRGB(255, 100, 100))
+            TweenService:Create(colourBoxGlowSpawn, TweenInfo.new(0.4, Enum.EasingStyle.Quad), {Color=targetColor}):Play()
+        end)
+
+        local savedEyeColoursSpawn = {}
+        local function snapshotEyesSpawn(searchRoot)
+            savedEyeColoursSpawn = {}
+            local eyeKeywords = { "eye","pupil","iris","cornea","sclera","eyelid","eyelash","eyebrow","retina","lens","highlight","gloss","shine","spec" }
+            for _, part in ipairs(searchRoot:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local name = part.Name:lower()
+                    local isNamedEye = false
+                    for _, kw in ipairs(eyeKeywords) do
+                        if name:find(kw) then isNamedEye = true; break end
+                    end
+                    local size = part.Size
+                    local isSmall = (size.X < 0.15 and size.Y < 0.15 and size.Z < 0.15)
+                    local c = part.Color
+                    local brightness = (c.R + c.G + c.B) / 3
+                    local isVeryDark  = brightness < 0.12
+                    local isVeryLight = brightness > 0.88
+                    local isSaturated = math.abs(c.R-c.G)>0.15 or math.abs(c.G-c.B)>0.15 or math.abs(c.R-c.B)>0.15
+                    if isNamedEye or (isSmall and (isVeryDark or (isVeryLight and not isSaturated))) then
+                        savedEyeColoursSpawn[part] = part.Color
+                    end
+                end
+            end
+        end
+
+        local function applyColourToPetSpawn(targetColor)
+            local wrappers = ClientData.get("pet_char_wrappers")
+            if not wrappers or #wrappers == 0 then
+                game.StarterGui:SetCore("SendNotification", {Title="No Pet Equipped", Text="Equip a pet first!", Duration=3})
+                return false
+            end
+            local petModel = wrappers[#wrappers].char
+            if not petModel or not petModel:IsDescendantOf(workspace) then
+                game.StarterGui:SetCore("SendNotification", {Title="Pet Not Found", Text="Could not find pet model.", Duration=3})
+                return false
+            end
+            local searchRoot = petModel:FindFirstChild("PetModel") or petModel
+            snapshotEyesSpawn(searchRoot)
+            local coloured = 0
+            for _, part in ipairs(searchRoot:GetDescendants()) do
+                if part:IsA("BasePart") and part.Material ~= Enum.Material.Neon then
+                    if not savedEyeColoursSpawn[part] then
+                        part.Color = targetColor
+                        coloured = coloured + 1
+                    end
+                end
+            end
+            for part, origColor in pairs(savedEyeColoursSpawn) do
+                if part and part.Parent then part.Color = origColor end
+            end
+            return coloured
+        end
+
+        local changeColourSpawnBtn = Instance.new("TextButton")
+        changeColourSpawnBtn.Size = UDim2.new(0.85, 0, 0, 26)
+        changeColourSpawnBtn.Position = UDim2.new(0.075, 0, 0, 330)
+        changeColourSpawnBtn.Text = "🖌️ Change Colour"
+        changeColourSpawnBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        changeColourSpawnBtn.BackgroundTransparency = 0.1
+        changeColourSpawnBtn.Font = Enum.Font.FredokaOne
+        changeColourSpawnBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        changeColourSpawnBtn.TextSize = 13
+        changeColourSpawnBtn.Parent = petContent
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,8); c.Parent = changeColourSpawnBtn
+            local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            s.Color = Color3.fromRGB(220,160,255); s.Thickness = 1.8; s.Transparency = 0.1; s.Parent = changeColourSpawnBtn
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = changeColourSpawnBtn
+        end
+        changeColourSpawnBtn.MouseEnter:Connect(function()
+            TweenService:Create(changeColourSpawnBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(185,105,225)}):Play()
+        end)
+        changeColourSpawnBtn.MouseLeave:Connect(function()
+            TweenService:Create(changeColourSpawnBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(160,80,200)}):Play()
+        end)
+        changeColourSpawnBtn.MouseButton1Click:Connect(function()
+            local col = hexToColor3Spawn(petColourBox.Text)
+            if not col then
+                game.StarterGui:SetCore("SendNotification", {Title="Invalid Hex", Text="Enter a valid 6-digit hex e.g. FF90C8", Duration=3})
+                return
+            end
+            local coloured = applyColourToPetSpawn(col)
+            if coloured and coloured > 0 then
+                game.StarterGui:SetCore("SendNotification", {
+                    Title = "🖌️ Colour Applied!",
+                    Text  = "#"..petColourBox.Text:gsub("^#",""):upper().." applied to "..coloured.." parts.",
+                    Duration = 4,
+                })
+            end
+        end)
+
+        local colourPreppySpawnBtn = Instance.new("TextButton")
+        colourPreppySpawnBtn.Size = UDim2.new(0.85, 0, 0, 26)
+        colourPreppySpawnBtn.Position = UDim2.new(0.075, 0, 0, 360)
+        colourPreppySpawnBtn.Text = "🎀 Colour Preppy Pet"
+        colourPreppySpawnBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        colourPreppySpawnBtn.BackgroundTransparency = 0.1
+        colourPreppySpawnBtn.Font = Enum.Font.FredokaOne
+        colourPreppySpawnBtn.TextColor3 = Color3.fromRGB(80, 20, 50)
+        colourPreppySpawnBtn.TextSize = 13
+        colourPreppySpawnBtn.Parent = petContent
+        do
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,8); c.Parent = colourPreppySpawnBtn
+            local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            s.Color = Color3.fromRGB(255,210,235); s.Thickness = 1.8; s.Transparency = 0.1; s.Parent = colourPreppySpawnBtn
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+            ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = colourPreppySpawnBtn
+        end
+        colourPreppySpawnBtn.MouseEnter:Connect(function()
+            TweenService:Create(colourPreppySpawnBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(255,175,215)}):Play()
+        end)
+        colourPreppySpawnBtn.MouseLeave:Connect(function()
+            TweenService:Create(colourPreppySpawnBtn, TweenInfo.new(0.12), {BackgroundColor3=Color3.fromRGB(255,155,205)}):Play()
+        end)
+        colourPreppySpawnBtn.MouseButton1Click:Connect(function()
+            local coloured = applyColourToPetSpawn(Color3.fromRGB(255, 144, 200))
+            if coloured and coloured > 0 then
+                game.StarterGui:SetCore("SendNotification", {
+                    Title = "🎀 Preppy Coloured!",
+                    Text  = "Pet body coloured to #FF90C8 ("..coloured.." parts).",
+                    Duration = 4,
+                })
+            end
+        end)
+
+        -- Toy name input
+
+        local toyNameBox = Instance.new("TextBox")
+        toyNameBox.Size = UDim2.new(0.85, 0, 0, 28)
+        toyNameBox.Position = UDim2.new(0.075, 0, 0, 10)
+        toyNameBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+        toyNameBox.BackgroundTransparency = 0.2
+        toyNameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        toyNameBox.TextSize = 14
+        toyNameBox.Font = Enum.Font.FredokaOne
+        toyNameBox.PlaceholderText = "Enter Toy Name to Spawn"
+        toyNameBox.Text = ""
+        toyNameBox.ClearTextOnFocus = false
+        toyNameBox.Parent = toyContent
+        Instance.new("UICorner", toyNameBox).CornerRadius = UDim.new(0, 6)
+        do
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.2; ts.Parent = toyNameBox
+        end
+        local toyBoxGlow = Instance.new("UIStroke")
+        toyBoxGlow.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        toyBoxGlow.Color = Color3.fromRGB(255, 255, 255)
+        toyBoxGlow.Thickness = 2.2
+        toyBoxGlow.Transparency = 0.25
+        toyBoxGlow.Parent = toyNameBox
+        local validToyNames = {}
+        local validToyNamesClean = {}
+        do
+            for id, item in pairs(InventoryDB.toys) do
+                validToyNames[#validToyNames + 1] = item.name
+                validToyNamesClean[#validToyNamesClean + 1] = item.name:lower():gsub("%s+", "")
+            end
+        end
+        local toyCurrentColorTween = nil
+        toyNameBox:GetPropertyChangedSignal("Text"):Connect(function()
+            lastCursorPosition = toyNameBox.CursorPosition
+            local inputText = toyNameBox.Text
+            local newText = capitalizeWords(inputText)
+            if newText ~= inputText then
+                toyNameBox.Text = newText
+                local addedChars = #newText - #inputText
+                toyNameBox.CursorPosition = math.max(1, math.min(lastCursorPosition + addedChars, #newText + 1))
+                return
+            end
+            local displayedText = toyNameBox.Text
+            local cleanName = displayedText:lower():gsub("%s+", "")
+            local isExactMatch = false
+            local isCleanMatch = false
+            for _, name in ipairs(validToyNames) do
+                if name:lower() == displayedText:lower() then isExactMatch = true break end
+            end
+            isCleanMatch = table.find(validToyNamesClean, cleanName) ~= nil
+            local targetColor
+            if displayedText == ""               then targetColor = SpawnerState.COLORS.NEUTRAL
+            elseif isExactMatch or isCleanMatch  then targetColor = SpawnerState.COLORS.VALID
+            else                                      targetColor = SpawnerState.COLORS.INVALID end
+            if toyCurrentColorTween then toyCurrentColorTween:Cancel() end
+            toyCurrentColorTween = TweenService:Create(toyBoxGlow, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Color = targetColor})
+            toyCurrentColorTween:Play()
+        end)
+        do
+            toyCurrentColorTween = TweenService:Create(toyBoxGlow, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Color = SpawnerState.COLORS.NEUTRAL})
+            toyCurrentColorTween:Play()
+        end
+        local toySpawnButton = Instance.new("TextButton")
+        toySpawnButton.Size = UDim2.new(0.6, 0, 0, 25)
+        toySpawnButton.Position = UDim2.new(0.2, 0, 0, 55)
+        toySpawnButton.Text = "Spawn Toy"
+        toySpawnButton.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        toySpawnButton.BackgroundTransparency = 0.1
+        toySpawnButton.Font = Enum.Font.FredokaOne
+        toySpawnButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+        toySpawnButton.TextSize = 16
+        toySpawnButton.Parent = toyContent
+        Instance.new("UICorner", toySpawnButton).CornerRadius = UDim.new(0, 8)
+        local toyButtonStroke = Instance.new("UIStroke")
+        toyButtonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        toyButtonStroke.Color = Color3.fromRGB(108,75,171)
+        toyButtonStroke.Thickness = 1.5
+        toyButtonStroke.Transparency = 0.1
+        toyButtonStroke.Parent = toySpawnButton
+        do
+            local ts = Instance.new("UIStroke"); ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual; ts.Color = Color3.new(0,0,0); ts.Thickness = 1.5; ts.Parent = toySpawnButton
+        end
+        local toyOriginalProperties = {
+            BackgroundColor3 = toySpawnButton.BackgroundColor3,
+            StrokeColor = Color3.fromRGB(255, 255, 255),
+            StrokeThickness = 1.5,
+            StrokeTransparency = 0.1
+        }
+        local toyActiveAnimation = { endTime = 0, strokeTween = nil, resetThread = nil, intensity = 1.0, lastSuccess = false }
+        toySpawnButton.MouseEnter:Connect(function()
+            if toyActiveAnimation.endTime < os.clock() then
+                toySpawnButton.BackgroundColor3 = Color3.fromRGB(50,45,65)
+                TweenService:Create(toyButtonStroke, TweenInfo.new(0.2), { Thickness = 2, Transparency = 0.05 }):Play()
+            end
+        end)
+        toySpawnButton.MouseLeave:Connect(function()
+            if toyActiveAnimation.endTime < os.clock() then
+                toySpawnButton.BackgroundColor3 = toyOriginalProperties.BackgroundColor3
+                TweenService:Create(toyButtonStroke, TweenInfo.new(0.2), { Thickness = toyOriginalProperties.StrokeThickness, Transparency = toyOriginalProperties.StrokeTransparency }):Play()
+            end
+        end)
+        toySpawnButton.MouseButton1Click:Connect(function()
+            local toy_name = toyNameBox.Text
+            local currentTime = os.clock()
+            local extendDuration = 1.5
+            local isExtension = currentTime < toyActiveAnimation.endTime
+            if isExtension then
+                toyActiveAnimation.intensity = math.min(toyActiveAnimation.intensity + 0.3, 1.5)
+            else
+                toyActiveAnimation.intensity = 1.0
+            end
+            if toyActiveAnimation.strokeTween then toyActiveAnimation.strokeTween:Cancel() end
+            if toyActiveAnimation.resetThread then coroutine.close(toyActiveAnimation.resetThread) end
+            local feedbackColor = Color3.fromRGB(255, 50, 50)
+            local spawnSuccess = false
+            if toy_name ~= "" then
+                local toyId = GetToyByName(toy_name)
+                if toyId then
+                    createToy(toyId)
+                    spawnSuccess = true
+                    game.StarterGui:SetCore("SendNotification", { Title = "Toy Spawned!", Text = toy_name .. " has been spawned!", Duration = 5 })
+                else
+                    game.StarterGui:SetCore("SendNotification", { Title = "Error", Text = "Toy not found: "..toy_name, Duration = 3 })
+                end
+            else
+                game.StarterGui:SetCore("SendNotification", { Title = "Error", Text = "Please enter a toy name!", Duration = 3 })
+            end
+            toyActiveAnimation.lastSuccess = spawnSuccess
+            if isExtension and toyActiveAnimation.lastSuccess then
+                feedbackColor = Color3.fromRGB(0, 255 * toyActiveAnimation.intensity, 0)
+            end
+            toyButtonStroke.Color = feedbackColor
+            toyButtonStroke.Thickness = 2 * toyActiveAnimation.intensity
+            toyButtonStroke.Transparency = 0.1 / toyActiveAnimation.intensity
+            if isExtension then
+                toyActiveAnimation.strokeTween = TweenService:Create(toyButtonStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Thickness = 2.5 * toyActiveAnimation.intensity, Transparency = 0.05 / toyActiveAnimation.intensity })
+                toyActiveAnimation.strokeTween:Play()
+            end
+            toyActiveAnimation.endTime = currentTime + extendDuration
+            toyActiveAnimation.resetThread = task.delay(extendDuration, function()
+                if os.clock() >= toyActiveAnimation.endTime then
+                    TweenService:Create(toyButtonStroke, TweenInfo.new(0.5, Enum.EasingStyle.Quad), { Color = toyOriginalProperties.StrokeColor, Thickness = toyOriginalProperties.StrokeThickness, Transparency = toyOriginalProperties.StrokeTransparency }):Play()
+                end
+            end)
+        end)
+        -- ── Spin on Add toggle (kept from original Spawn tab) ──────────
+        local spinOnAddFrame = Instance.new("Frame")
+        spinOnAddFrame.Size = UDim2.new(1, 0, 0, 30)
+        spinOnAddFrame.BackgroundTransparency = 1
+        spinOnAddFrame.LayoutOrder = 4
+        spinOnAddFrame.Parent = spawnFrame
+        local spinOnAddBtn = Instance.new("TextButton")
+        spinOnAddBtn.Size = UDim2.new(1, 0, 1, 0)
+        spinOnAddBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        spinOnAddBtn.Text = "Spin on +: OFF"
+        spinOnAddBtn.Font = Enum.Font.FredokaOne
+        spinOnAddBtn.TextSize = 11
+        spinOnAddBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        spinOnAddBtn.Parent = spinOnAddFrame
+        Instance.new("UICorner", spinOnAddBtn).CornerRadius = UDim.new(0, 4)
+        local soaStroke = Instance.new("UIStroke")
+        soaStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        soaStroke.Color = Color3.fromRGB(108,75,171)
+        soaStroke.Thickness = 1.5; soaStroke.Transparency = 0.3
+        soaStroke.Parent = spinOnAddBtn
+        spinOnAddBtn.MouseButton1Click:Connect(function()
+            _G._SpinOnAdd = not (_G._SpinOnAdd or false)
+            if _G._SpinOnAdd then
+                spinOnAddBtn.Text = "Spin on +: ON"
+                spinOnAddBtn.BackgroundColor3 = Color3.fromRGB(55,45,75)
+                soaStroke.Color = Color3.fromRGB(160,130,210)
+            else
+                spinOnAddBtn.Text = "Spin on +: OFF"
+                spinOnAddBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+                soaStroke.Color = Color3.fromRGB(108,75,171)
+            end
+        end)
+        -- ── Admin Popup spam (kept from original Spawn tab) ────────────
+        local spamAdminFrame = Instance.new("Frame")
+        spamAdminFrame.Size = UDim2.new(1, 0, 0, 30)
+        spamAdminFrame.BackgroundTransparency = 1
+        spamAdminFrame.LayoutOrder = 5
+        spamAdminFrame.Parent = spawnFrame
+        local spamAdminBtn = Instance.new("TextButton")
+        spamAdminBtn.Size = UDim2.new(1, 0, 1, 0)
+        spamAdminBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        spamAdminBtn.Text = "Spam Admin Popup: OFF"
+        spamAdminBtn.Font = Enum.Font.FredokaOne
+        spamAdminBtn.TextSize = 11
+        spamAdminBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        spamAdminBtn.Parent = spamAdminFrame
+        Instance.new("UICorner", spamAdminBtn).CornerRadius = UDim.new(0, 4)
+        local spamAdminStroke = Instance.new("UIStroke")
+        spamAdminStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        spamAdminStroke.Color = Color3.fromRGB(108,75,171)
+        spamAdminStroke.Thickness = 1.5; spamAdminStroke.Transparency = 0.3
+        spamAdminStroke.Parent = spamAdminBtn
+        spamAdminBtn.MouseButton1Click:Connect(function()
+            local isOn = _G._SpamAdminActive or false
+            _G._SpamAdminActive = not isOn
+            if _G._SpamAdminActive then
+                spamAdminBtn.Text = "Spam Admin Popup: ON"
+                spamAdminBtn.BackgroundColor3 = Color3.fromRGB(55,45,75)
+                spamAdminStroke.Color = Color3.fromRGB(160,130,210)
+                if _G._StartSpamAdmin then _G._StartSpamAdmin() end
+            else
+                spamAdminBtn.Text = "Spam Admin Popup: OFF"
+                spamAdminBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+                spamAdminStroke.Color = Color3.fromRGB(108,75,171)
+            end
+        end)
+    end)
+end
+-- PLAYERS TAB
+do
+local playersFrame = tabFrames["Players"]
+local playersLayout = Instance.new("UIListLayout"); playersLayout.SortOrder = Enum.SortOrder.LayoutOrder
+playersLayout.Padding = UDim.new(0,4); playersLayout.Parent = playersFrame
+
+-- Select Current Partner button
+local selectPartnerBtn = Instance.new("TextButton")
+selectPartnerBtn.Size = UDim2.new(1,0,0,26); selectPartnerBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+selectPartnerBtn.Text = "Select Current Partner"; selectPartnerBtn.Font = Enum.Font.FredokaOne; selectPartnerBtn.TextSize = 11
+selectPartnerBtn.TextColor3 = Color3.fromRGB(255,255,255); selectPartnerBtn.LayoutOrder = 0; selectPartnerBtn.Parent = playersFrame
+Instance.new("UICorner", selectPartnerBtn).CornerRadius = UDim.new(0,4)
+local spStroke = Instance.new("UIStroke"); spStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+spStroke.Color = Color3.fromRGB(108,75,171); spStroke.Thickness = 1.5; spStroke.Transparency = 0.3; spStroke.Parent = selectPartnerBtn
+
+selectPartnerBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        local state = TradeApp:_get_local_trade_state()
+        if not state then
+            if HintApp then HintApp:hint({ text = "No active trade.", length = 2, overridable = true }) end
+            return
+        end
+        local partner = state.sender == Players.LocalPlayer and state.recipient or state.sender
+        if partner then
+            if _G._partnerBox then _G._partnerBox.Text = partner.Name end
+            CONFIG.PARTNER_NAME = partner.Name
+            task.spawn(updatePartnerFromUsername, partner.Name)
+            setActiveTab("Control")
+            -- hint removed
+        end
+    end)
+end)
+
+local playerListFrame = Instance.new("ScrollingFrame"); playerListFrame.Size = UDim2.new(1,0,1,-30); playerListFrame.BackgroundColor3 = Color3.fromRGB(25,25,35)
+playerListFrame.BackgroundTransparency = 0.5; playerListFrame.BorderSizePixel = 0; playerListFrame.ScrollBarThickness = 3
+playerListFrame.ScrollBarImageColor3 = Color3.fromRGB(100,100,100); playerListFrame.ScrollBarImageTransparency = 0.5
+playerListFrame.CanvasSize = UDim2.new(0,0,0,0); playerListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y; playerListFrame.LayoutOrder = 1; playerListFrame.Parent = playersFrame
+Instance.new("UICorner",playerListFrame).CornerRadius = UDim.new(0,6)
+local playerListLayout = Instance.new("UIListLayout"); playerListLayout.SortOrder = Enum.SortOrder.LayoutOrder; playerListLayout.Padding = UDim.new(0,5); playerListLayout.Parent = playerListFrame
+local listPadding = Instance.new("UIPadding"); listPadding.PaddingTop = UDim.new(0,6); listPadding.PaddingBottom = UDim.new(0,6); listPadding.PaddingLeft = UDim.new(0,8); listPadding.PaddingRight = UDim.new(0,8); listPadding.Parent = playerListFrame
+local function createPlayerButton(player, index)
+    local button = Instance.new("Frame"); button.Size = UDim2.new(1,-4,0,34); button.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    button.BackgroundTransparency = 0.2; button.LayoutOrder = index; button.Parent = playerListFrame
+    Instance.new("UICorner",button).CornerRadius = UDim.new(0,6)
+    local buttonStroke = Instance.new("UIStroke"); buttonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    buttonStroke.Color = Color3.fromRGB(108,75,171); buttonStroke.Thickness = 1.0; buttonStroke.Transparency = 0.3; buttonStroke.Parent = button
+
+    -- Name + value label
+    local nameLabel = Instance.new("TextLabel"); nameLabel.Size = UDim2.new(1,-95,1,0); nameLabel.Position = UDim2.new(0,7,0,0)
+    nameLabel.BackgroundTransparency = 1; nameLabel.Text = player.Name; nameLabel.Font = Enum.Font.FredokaOne
+    nameLabel.TextScaled = true; nameLabel.TextColor3 = Color3.fromRGB(255,255,255); nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.RichText = true; nameLabel.Parent = button
+    Instance.new("UITextSizeConstraint", nameLabel).MaxTextSize = 14
+
+    -- Profile + Trade buttons on right
+    local btnRow = Instance.new("Frame"); btnRow.Size = UDim2.new(0,84,0,22); btnRow.Position = UDim2.new(1,-88,0.5,-11)
+    btnRow.BackgroundTransparency = 1; btnRow.Parent = button
+    local brl = Instance.new("UIListLayout"); brl.FillDirection = Enum.FillDirection.Horizontal
+    brl.Padding = UDim.new(0,3); brl.SortOrder = Enum.SortOrder.LayoutOrder; brl.Parent = btnRow
+
+    local function makeSmallBtn(lbl, order)
+        local b = Instance.new("TextButton"); b.Size = UDim2.new(0,40,1,0); b.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        b.Text = lbl; b.Font = Enum.Font.FredokaOne; b.TextSize = 9; b.TextColor3 = Color3.fromRGB(255,255,255)
+        b.LayoutOrder = order; b.Parent = btnRow
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,3)
+        Instance.new("UIStroke", b).Color = Color3.fromRGB(108,75,171)
+        return b
+    end
+
+    local profileBtn = makeSmallBtn("Profile", 1)
+    local tradeBtn   = makeSmallBtn("Trade",   2)
+
+    profileBtn.MouseButton1Click:Connect(function()
+        pcall(function() UIManager.apps.PlayerProfileApp:open_player_profile_for_user_id(player.UserId) end)
+    end)
+    tradeBtn.MouseButton1Click:Connect(function()
+        sendTradeRequest(player)
+        TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(0,255,100),Transparency=0}):Play()
+        task.delay(0.5,function() TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(108,75,171),Transparency=0.3}):Play() end)
+    end)
+
+    -- Click row = set as partner
+    local clickable = Instance.new("TextButton"); clickable.Size = UDim2.new(1,-90,1,0); clickable.BackgroundTransparency = 1
+    clickable.Text = ""; clickable.Parent = button
+    clickable.MouseButton1Click:Connect(function()
+        if _G._partnerBox then _G._partnerBox.Text = player.Name end; CONFIG.PARTNER_NAME = player.Name; task.spawn(updatePartnerFromUsername, player.Name); setActiveTab("Control")
+        TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(0,255,100),Transparency=0}):Play()
+        task.delay(0.5,function() TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(108,75,171),Transparency=0.3}):Play() end)
+    end)
+
+    -- Load elve value async and append to name
+    task.spawn(function()
+        local ok, col = pcall(GetPlayerCollectionPets, player)
+        if ok and col and col.pets then
+            local t0 = tick()
+            while not elveLoaded and tick()-t0 < 5 do task.wait(0.2) end
+            local val = calcCollectionValue(col.pets)
+            if button.Parent then
+                if val > 0 then
+                    nameLabel.Text = player.Name .. '  <font color="#64dc64" size="10">' .. math.floor(val) .. '</font>'
+                    decorateNameLabel(nameLabel, player.Name, player.UserId)
+                end
+            end
+        end
+    end)
+end
+local sorted = Players:GetPlayers(); table.sort(sorted, function(a,b) return a.Name:lower() < b.Name:lower() end)
+for i, p in ipairs(sorted) do createPlayerButton(p,i) end
+Players.PlayerAdded:Connect(function(p) createPlayerButton(p, #Players:GetPlayers()) end)
+end -- Players tab
+
+-- =====================================================================
+-- PRESET TAB
+-- =====================================================================
+do
+local PRESET_USERS = {
+    'Agusmareborn', 'Kellyvault', 'J3llynoah', 'Rainbowriley321', 'Bobazmalibu',
+    'H3llSANG3LX', 'Xcallmeholly', 'Niniko_201999', 'Hugso09', 'ruthjavxn', 'bwpico',
+    'Hugeinvestor', 'Barborich2', 'Underthechemtrailss', 'Bunzvii', 'Qwrtylostaccount',
+    'Sparklingorangelol', 'Tr3ndzyy', 'Jellycmt', 'Ex4clusiv3', 'Killersana66',
+    'Chasedatfund', 'Pukgames0', 'Lathifcal', 'Tadhghogan009', 'Firefelineyt',
+    'Jasperisdic', 'Coalberto', 'Mouasx', 'CodyPlays', 'GustaboStraw', 'Medinololboi',
+    'Mousey_321', 'AuraBossFarms', 'Track_T0R', 'Moon_Shadow3A', 'Textymax',
+    'Alisawants', 'Colemule', 'ColdShadow', 'EvergreenPlane', 'Elisacanlisten',
+    'Money_Money1000', 'Adelf_Heitler', 'Mangowewuwu', 'ChipsYdeutsch', 'CheasyCheese',
+    'GusPlaysYou', 'Miami_City', 'ZodicolWantsPets', 'Moe_Farmsthegrass',
+    'Sillyoldgoose', 'ObamaBeenLoading', 'Giraffe_Carrot', '89OliverWest',
+}
+
+local presetFrame = tabFrames["Preset"]
+local presetListFrame = Instance.new("ScrollingFrame")
+presetListFrame.Size = UDim2.new(1,0,1,-30); presetListFrame.BackgroundColor3 = Color3.fromRGB(25,25,35)
+presetListFrame.BackgroundTransparency = 0.5; presetListFrame.BorderSizePixel = 0
+presetListFrame.CanvasSize = UDim2.new(0,0,0,0); presetListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+presetListFrame.ScrollBarThickness = 3; presetListFrame.ScrollBarImageColor3 = Color3.fromRGB(108,75,171)
+presetListFrame.LayoutOrder = 1; presetListFrame.Parent = presetFrame
+local presetListLayout = Instance.new("UIListLayout"); presetListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+presetListLayout.Padding = UDim.new(0,3); presetListLayout.Parent = presetListFrame
+local presetListPad = Instance.new("UIPadding"); presetListPad.PaddingTop = UDim.new(0,4)
+presetListPad.PaddingLeft = UDim.new(0,4); presetListPad.PaddingRight = UDim.new(0,4); presetListPad.Parent = presetListFrame
+
+local function createPresetButton(username, index)
+    local button = Instance.new("Frame"); button.Size = UDim2.new(1,-4,0,34); button.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    button.BackgroundTransparency = 0.2; button.LayoutOrder = index; button.Parent = presetListFrame
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0,6)
+    local buttonStroke = Instance.new("UIStroke"); buttonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    buttonStroke.Color = Color3.fromRGB(108,75,171); buttonStroke.Thickness = 1; buttonStroke.Transparency = 0.3; buttonStroke.Parent = button
+
+    local nameLabel = Instance.new("TextLabel"); nameLabel.Size = UDim2.new(1,-95,1,0); nameLabel.Position = UDim2.new(0,7,0,0)
+    nameLabel.BackgroundTransparency = 1; nameLabel.Text = username; nameLabel.Font = Enum.Font.FredokaOne
+    nameLabel.TextScaled = true; nameLabel.TextColor3 = Color3.fromRGB(255,255,255)
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left; nameLabel.RichText = true; nameLabel.Parent = button
+    Instance.new("UITextSizeConstraint", nameLabel).MaxTextSize = 14
+    task.spawn(function()
+        local ok, uid = pcall(function() return Players:GetUserIdFromNameAsync(username) end)
+        if ok and uid then decorateNameLabel(nameLabel, username, uid) end
+    end)
+
+    local btnRow = Instance.new("Frame"); btnRow.Size = UDim2.new(0,84,0,22); btnRow.Position = UDim2.new(1,-88,0.5,-11)
+    btnRow.BackgroundTransparency = 1; btnRow.Parent = button
+    local brl = Instance.new("UIListLayout"); brl.FillDirection = Enum.FillDirection.Horizontal
+    brl.Padding = UDim.new(0,3); brl.SortOrder = Enum.SortOrder.LayoutOrder; brl.Parent = btnRow
+
+    local function makeSmallBtn(lbl, order)
+        local b = Instance.new("TextButton"); b.Size = UDim2.new(0,40,1,0); b.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        b.Text = lbl; b.Font = Enum.Font.FredokaOne; b.TextSize = 9; b.TextColor3 = Color3.fromRGB(255,255,255)
+        b.LayoutOrder = order; b.Parent = btnRow
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,3)
+        Instance.new("UIStroke", b).Color = Color3.fromRGB(108,75,171)
+        return b
+    end
+    local profileBtn = makeSmallBtn("Profile", 1)
+    local tradeBtn   = makeSmallBtn("Trade",   2)
+
+    -- Click row = set as partner
+    local clickable = Instance.new("TextButton"); clickable.Size = UDim2.new(1,-90,1,0); clickable.BackgroundTransparency = 1
+    clickable.Text = ""; clickable.Parent = button
+    clickable.MouseButton1Click:Connect(function()
+        if _G._partnerBox then _G._partnerBox.Text = username end; CONFIG.PARTNER_NAME = username
+        task.spawn(updatePartnerFromUsername, username); setActiveTab("Control")
+        TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(0,255,100),Transparency=0}):Play()
+        task.delay(0.5,function() TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(108,75,171),Transparency=0.3}):Play() end)
+    end)
+
+    -- Resolve userId and wire buttons async
+    task.spawn(function()
+        local ok, userId = pcall(function() return Players:GetUserIdFromNameAsync(username) end)
+        if not ok or not userId then return end
+
+        profileBtn.MouseButton1Click:Connect(function()
+            pcall(function() UIManager.apps.PlayerProfileApp:open_player_profile_for_user_id(userId) end)
+        end)
+        tradeBtn.MouseButton1Click:Connect(function()
+            local player = Players:GetPlayerByUserId(userId)
+            if player then
+                sendTradeRequest(player)
+                TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(0,255,100),Transparency=0}):Play()
+                task.delay(0.5,function() TweenService:Create(buttonStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(108,75,171),Transparency=0.3}):Play() end)
+            else
+                if HintApp then HintApp:hint({ text = username .. " is not in this server.", length = 2, overridable = true }) end
+            end
+        end)
+
+        -- Load elve value from profile collection
+        local ok2, col = pcall(GetPlayerCollectionPetsByUserId, userId)
+        if ok2 and col and col.pets then
+            local t0 = tick()
+            while not elveLoaded and tick()-t0 < 5 do task.wait(0.2) end
+            local val = calcCollectionValue(col.pets)
+            if button.Parent and val > 0 then
+                nameLabel.Text = username .. '  <font color="#64dc64" size="10">' .. math.floor(val) .. '</font>'
+            end
+        end
+    end)
+end
+
+for i, username in ipairs(PRESET_USERS) do
+    createPresetButton(username, i)
+end
+end -- Preset tab
+
+-- =====================================================================
+-- MISC TAB — Badge pet picker (toggleable dropdown)
+-- =====================================================================
+-- Wrap the tab content in a ScrollingFrame so the growing list of misc sections fits.
+-- We keep tabFrames["Misc"] as the outer container (so setActiveTab still toggles
+-- visibility correctly) and parent the ScrollingFrame inside it; descendants
+-- inherit the outer Visible flag, so hiding the tab hides the scroll content too.
+local miscFrame
+do
+    local _miscTabFrame = tabFrames["Misc"]
+    for _, v in ipairs(_miscTabFrame:GetChildren()) do v:Destroy() end
+    -- Override the generic 90%-width tabFrame so the Misc tab uses the entire
+    -- mainFrame interior — gives the scroll content full breathing room.
+    _miscTabFrame.Size     = UDim2.new(1, 0, 1, -56)
+    _miscTabFrame.Position = UDim2.new(0, 0, 0, 56)
+    local miscScroll = Instance.new("ScrollingFrame")
+    miscScroll.Size = UDim2.new(1, 0, 1, 0); miscScroll.Position = UDim2.new(0,0,0,0)
+    miscScroll.BackgroundTransparency = 1; miscScroll.BorderSizePixel = 0
+    miscScroll.ScrollBarThickness = 4
+    miscScroll.ScrollBarImageColor3 = Color3.fromRGB(108,75,171)
+    miscScroll.ScrollBarImageTransparency = 0.2
+    miscScroll.CanvasSize = UDim2.new(0,0,0,0)
+    miscScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    miscScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    miscScroll.ClipsDescendants = true
+    miscScroll.Parent = _miscTabFrame
+    miscFrame = miscScroll
+end
+do -- misc section 1
+    local miscLayout = Instance.new("UIListLayout")
+    miscLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    miscLayout.Padding   = UDim.new(0, 5)
+    miscLayout.Parent    = miscFrame
+
+    local miscPad = Instance.new("UIPadding")
+    miscPad.PaddingTop    = UDim.new(0, 6)
+    miscPad.PaddingBottom = UDim.new(0, 10)
+    miscPad.PaddingLeft   = UDim.new(0, 10)
+    miscPad.PaddingRight  = UDim.new(0, 12)
+    miscPad.Parent = miscFrame
+
+    -- ── Offer Values ──────────────────────────────────────────────────
+    local function calcOfferValue(items)
+        if not items then return nil end
+        local total = 0; local missing = 0
+        for _, item in ipairs(items) do
+            if item.kind then
+                local kindData = InventoryDB.pets and InventoryDB.pets[item.kind]
+                local name = kindData and kindData.name or item.kind
+                local v = getElveValue(name, item.properties)
+                if v then total = total + v else missing = missing + 1 end
+            end
+        end
+        return total, missing
+    end
+
+    -- Offer value row
+    local offerValueRow = Instance.new("Frame")
+    offerValueRow.Size = UDim2.new(1,0,0,24); offerValueRow.BackgroundTransparency = 1
+    offerValueRow.LayoutOrder = 0; offerValueRow.Parent = miscFrame
+
+    local function makeOfferCard(xPos, label)
+        local card = Instance.new("Frame")
+        card.Size = UDim2.new(0.5,-3,1,0); card.Position = UDim2.new(xPos,xPos>0 and 3 or 0,0,0)
+        card.BackgroundColor3 = Color3.fromRGB(30,30,42); card.BorderSizePixel = 0; card.Parent = offerValueRow
+        Instance.new("UICorner", card).CornerRadius = UDim.new(0,5)
+        local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(70,70,90); s.Thickness = 1; s.Parent = card
+        local lbl = Instance.new("TextLabel"); lbl.Size = UDim2.new(1,0,0,13); lbl.BackgroundTransparency = 1
+        lbl.Text = label; lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 9
+        lbl.TextColor3 = Color3.fromRGB(140,140,160); lbl.Parent = card
+        local val = Instance.new("TextLabel"); val.Size = UDim2.new(1,0,1,-13); val.Position = UDim2.new(0,0,0,13)
+        val.BackgroundTransparency = 1; val.Text = "—"; val.Font = Enum.Font.GothamBold; val.TextSize = 12
+        val.TextColor3 = Color3.fromRGB(255,255,255); val.Parent = card
+        return val
+    end
+
+    local myValueLbl      = makeOfferCard(0,   "Your Offer")
+    local partnerValueLbl = makeOfferCard(0.5, "Partner Offer")
+
+    -- Update values every 0.5s while trade active
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if not elveLoaded then
+                myValueLbl.Text = "loading…"; partnerValueLbl.Text = "loading…"; continue
+            end
+            if not (mockState and mockState.active and mockState.trade) then
+                myValueLbl.Text = "—"; partnerValueLbl.Text = "—"; continue
+            end
+            local myTotal, myMiss = calcOfferValue(mockState.trade.sender_offer.items)
+            local ptTotal, ptMiss = calcOfferValue(mockState.trade.recipient_offer.items)
+            local function fmt(total, miss)
+                if not total then return "—" end
+                local s = tostring(math.floor(total))
+                if miss and miss > 0 then s = s .. " (+" .. miss .. " unk)" end
+                return s
+            end
+            myValueLbl.Text = fmt(myTotal, myMiss)
+            partnerValueLbl.Text = fmt(ptTotal, ptMiss)
+        end
+    end)
+
+    -- ── Badge Icon Toggle ─────────────────────────────────────────────
+    do
+        local badgeToggleRow = Instance.new("Frame")
+        badgeToggleRow.Size = UDim2.new(1,0,0,22); badgeToggleRow.BackgroundTransparency = 1
+        badgeToggleRow.LayoutOrder = 0; badgeToggleRow.Parent = miscFrame
+
+        local badgeLbl = Instance.new("TextLabel")
+        badgeLbl.Size = UDim2.new(1,-52,1,0); badgeLbl.BackgroundTransparency = 1
+        badgeLbl.Text = "Badge Icon"; badgeLbl.Font = Enum.Font.SourceSansSemibold
+        badgeLbl.TextSize = 11; badgeLbl.TextColor3 = Color3.fromRGB(200,200,210)
+        badgeLbl.TextXAlignment = Enum.TextXAlignment.Left; badgeLbl.Parent = badgeToggleRow
+
+        local badgeBtn = Instance.new("TextButton")
+        badgeBtn.Size = UDim2.new(0,46,1,0); badgeBtn.Position = UDim2.new(1,-46,0,0)
+        badgeBtn.BackgroundColor3 = Color3.fromRGB(30,80,50); badgeBtn.Text = "ON"
+        badgeBtn.Font = Enum.Font.GothamBold; badgeBtn.TextSize = 10
+        badgeBtn.TextColor3 = Color3.fromRGB(80,255,130); badgeBtn.Parent = badgeToggleRow
+        Instance.new("UICorner", badgeBtn).CornerRadius = UDim.new(0,4)
+        local badgeStroke = Instance.new("UIStroke")
+        badgeStroke.Color = Color3.fromRGB(0,255,100); badgeStroke.Thickness = 1; badgeStroke.Parent = badgeBtn
+
+        local function applyBadgeVisible(visible)
+            pcall(function()
+                local tGui = Players.LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+                if not tGui then return end
+                local ni = tGui.Frame.NegotiationFrame.Header.YouFrame:FindFirstChild("Icon")
+                if ni then ni.Visible = visible end
+                local ci = tGui.Frame.ConfirmationFrame:FindFirstChild("YouIcon")
+                if ci then ci.Visible = visible end
+            end)
+        end
+
+        badgeBtn.MouseButton1Click:Connect(function()
+            BADGE_ICON_ENABLED = not BADGE_ICON_ENABLED
+            applyBadgeVisible(BADGE_ICON_ENABLED)
+            if BADGE_ICON_ENABLED then
+                badgeBtn.Text = "ON"
+                badgeBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+                badgeBtn.TextColor3 = Color3.fromRGB(80,255,130)
+                badgeStroke.Color = Color3.fromRGB(0,255,100)
+            else
+                badgeBtn.Text = "OFF"
+                badgeBtn.BackgroundColor3 = Color3.fromRGB(60,30,30)
+                badgeBtn.TextColor3 = Color3.fromRGB(255,120,120)
+                badgeStroke.Color = Color3.fromRGB(160,60,60)
+            end
+        end)
+    end
+
+
+    -- ── Badge Icon Toggle ─────────────────────────────────────────────
+    do
+        local badgeToggleRow = Instance.new("Frame")
+        badgeToggleRow.Size = UDim2.new(1,0,0,22); badgeToggleRow.BackgroundTransparency = 1
+        badgeToggleRow.LayoutOrder = 0; badgeToggleRow.Parent = miscFrame
+        local badgeLbl = Instance.new("TextLabel")
+        badgeLbl.Size = UDim2.new(1,-52,1,0); badgeLbl.BackgroundTransparency = 1
+        badgeLbl.Text = "Badge Icon"; badgeLbl.Font = Enum.Font.SourceSansSemibold
+        badgeLbl.TextSize = 11; badgeLbl.TextColor3 = Color3.fromRGB(200,200,210)
+        badgeLbl.TextXAlignment = Enum.TextXAlignment.Left; badgeLbl.Parent = badgeToggleRow
+        local badgeBtn = Instance.new("TextButton")
+        badgeBtn.Size = UDim2.new(0,46,1,0); badgeBtn.Position = UDim2.new(1,-46,0,0)
+        badgeBtn.BackgroundColor3 = Color3.fromRGB(30,80,50); badgeBtn.Text = "ON"
+        badgeBtn.Font = Enum.Font.GothamBold; badgeBtn.TextSize = 10
+        badgeBtn.TextColor3 = Color3.fromRGB(80,255,130); badgeBtn.Parent = badgeToggleRow
+        Instance.new("UICorner", badgeBtn).CornerRadius = UDim.new(0,4)
+        local badgeStroke = Instance.new("UIStroke")
+        badgeStroke.Color = Color3.fromRGB(0,255,100); badgeStroke.Thickness = 1; badgeStroke.Parent = badgeBtn
+        local function applyBadgeVisible(visible)
+            pcall(function()
+                local tGui = Players.LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+                if not tGui then return end
+                local ni = tGui.Frame.NegotiationFrame.Header.YouFrame:FindFirstChild("Icon")
+                if ni then ni.Visible = visible end
+                local ci = tGui.Frame.ConfirmationFrame:FindFirstChild("YouIcon")
+                if ci then ci.Visible = visible end
+            end)
+        end
+        badgeBtn.MouseButton1Click:Connect(function()
+            BADGE_ICON_ENABLED = not BADGE_ICON_ENABLED
+            applyBadgeVisible(BADGE_ICON_ENABLED)
+            if BADGE_ICON_ENABLED then
+                badgeBtn.Text = "ON"; badgeBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+                badgeBtn.TextColor3 = Color3.fromRGB(80,255,130); badgeStroke.Color = Color3.fromRGB(0,255,100)
+            else
+                badgeBtn.Text = "OFF"; badgeBtn.BackgroundColor3 = Color3.fromRGB(60,30,30)
+                badgeBtn.TextColor3 = Color3.fromRGB(255,120,120); badgeStroke.Color = Color3.fromRGB(160,60,60)
+            end
+        end)
+    end
+
+    -- ── Badge Role Picker ─────────────────────────────────────────────
+    do
+        local BADGES = {
+            { label="None (clear)",  icon=nil,                           tag=nil          },
+            { label="Founder",       icon="rbxassetid://5269331469",     tag="founder"    },
+            { label="Developer",     icon="rbxassetid://5269331469",     tag="developer"  },
+            { label="Staff",         icon="rbxassetid://5269331469",     tag="staff"      },
+            { label="Influencer",    icon="rbxassetid://5269331158",     tag="influencer" },
+            { label="VIP",           icon="rbxassetid://18536111292",    tag="vip"        },
+        }
+
+        local roleSecLbl = Instance.new("TextLabel")
+        roleSecLbl.Size = UDim2.new(1,0,0,13); roleSecLbl.BackgroundTransparency = 1
+        roleSecLbl.Text = "🏅 Badge Role"; roleSecLbl.Font = Enum.Font.SourceSansSemibold
+        roleSecLbl.TextSize = 11; roleSecLbl.TextColor3 = Color3.fromRGB(180,180,180)
+        roleSecLbl.TextXAlignment = Enum.TextXAlignment.Left
+        roleSecLbl.LayoutOrder = 0; roleSecLbl.Parent = miscFrame
+
+        -- Dropdown toggle button
+        local dropToggle = Instance.new("TextButton")
+        dropToggle.Size = UDim2.new(1,0,0,24)
+        dropToggle.BackgroundColor3 = Color3.fromRGB(40,30,60)
+        dropToggle.BackgroundTransparency = 0.3
+        dropToggle.Text = ""; dropToggle.AutoButtonColor = false
+        dropToggle.LayoutOrder = 0; dropToggle.Parent = miscFrame
+        Instance.new("UICorner", dropToggle).CornerRadius = UDim.new(0,5)
+        local dtStroke = Instance.new("UIStroke")
+        dtStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        dtStroke.Color = Color3.fromRGB(180,100,255); dtStroke.Thickness = 1.5
+        dtStroke.Transparency = 0.2; dtStroke.Parent = dropToggle
+
+        local dtIcon = Instance.new("ImageLabel")
+        dtIcon.Size = UDim2.new(0,18,0,18); dtIcon.Position = UDim2.new(0,4,0.5,-9)
+        dtIcon.BackgroundTransparency = 1; dtIcon.ScaleType = Enum.ScaleType.Fit
+        dtIcon.Image = BADGES[2].icon; dtIcon.Parent = dropToggle
+
+        local dtLabel = Instance.new("TextLabel")
+        dtLabel.Size = UDim2.new(1,-40,1,0); dtLabel.Position = UDim2.new(0,26,0,0)
+        dtLabel.BackgroundTransparency = 1; dtLabel.Text = "Founder"
+        dtLabel.Font = Enum.Font.FredokaOne; dtLabel.TextSize = 11
+        dtLabel.TextColor3 = Color3.fromRGB(220,180,255)
+        dtLabel.TextXAlignment = Enum.TextXAlignment.Left
+        dtLabel.TextTruncate = Enum.TextTruncate.AtEnd; dtLabel.Parent = dropToggle
+
+        local dtArrow = Instance.new("TextLabel")
+        dtArrow.Size = UDim2.new(0,16,1,0); dtArrow.Position = UDim2.new(1,-18,0,0)
+        dtArrow.BackgroundTransparency = 1; dtArrow.Text = "▾"
+        dtArrow.Font = Enum.Font.GothamBold; dtArrow.TextSize = 11
+        dtArrow.TextColor3 = Color3.fromRGB(180,140,220); dtArrow.Parent = dropToggle
+
+        -- Dropdown list
+        local dropList = Instance.new("Frame")
+        dropList.Size = UDim2.new(1,0,0,0)
+        dropList.BackgroundTransparency = 1
+        dropList.AutomaticSize = Enum.AutomaticSize.Y
+        dropList.Visible = false; dropList.LayoutOrder = 0; dropList.Parent = miscFrame
+        local dlLayout = Instance.new("UIListLayout")
+        dlLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        dlLayout.Padding = UDim.new(0,2); dlLayout.Parent = dropList
+
+        for i, badge in ipairs(BADGES) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1,0,0,22)
+            btn.BackgroundColor3 = Color3.fromRGB(35,25,55)
+            btn.BackgroundTransparency = 0.3; btn.Text = ""
+            btn.AutoButtonColor = false; btn.LayoutOrder = i; btn.Parent = dropList
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+            local bStroke = Instance.new("UIStroke")
+            bStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            bStroke.Color = Color3.fromRGB(150,80,220); bStroke.Thickness = 1
+            bStroke.Transparency = 0.5; bStroke.Parent = btn
+
+            if badge.icon then
+                local bIcon = Instance.new("ImageLabel")
+                bIcon.Size = UDim2.new(0,16,0,16); bIcon.Position = UDim2.new(0,4,0.5,-8)
+                bIcon.BackgroundTransparency = 1; bIcon.ScaleType = Enum.ScaleType.Fit
+                bIcon.Image = badge.icon; bIcon.Parent = btn
+            end
+
+            local bLabel = Instance.new("TextLabel")
+            bLabel.Size = UDim2.new(1,-28,1,0); bLabel.Position = UDim2.new(0,24,0,0)
+            bLabel.BackgroundTransparency = 1; bLabel.Text = badge.label
+            bLabel.Font = Enum.Font.FredokaOne; bLabel.TextSize = 10
+            bLabel.TextColor3 = Color3.fromRGB(210,180,255)
+            bLabel.TextXAlignment = Enum.TextXAlignment.Left; bLabel.Parent = btn
+
+            btn.MouseEnter:Connect(function()
+                TweenService:Create(btn,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(60,40,90)}):Play()
+            end)
+            btn.MouseLeave:Connect(function()
+                TweenService:Create(btn,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(35,25,55)}):Play()
+            end)
+
+            local cap = badge
+            btn.MouseButton1Click:Connect(function()
+                -- Update the global badge image used by lockIcon
+                BADGE_IMAGE = cap.icon or ""
+                dtLabel.Text = cap.label
+                dtIcon.Image = cap.icon or ""
+                dropList.Visible = false
+                dtArrow.Text = "▾"
+
+                -- Apply to active trade GUI instantly
+                pcall(function()
+                    local tradeGui = Players.LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+                    if tradeGui then
+                        local icon = tradeGui.Frame.NegotiationFrame.Header.YouFrame:FindFirstChild("Icon")
+                        if icon then
+                            if cap.icon then
+                                icon.Image = cap.icon
+                                icon.Visible = true
+                                icon.ImageTransparency = 0
+                                icon.ImageColor3 = Color3.new(1,1,1)
+                                icon.Size = UDim2.new(0,30,0,30)
+                            else
+                                icon.Visible = false
+                            end
+                        end
+                        local cIcon = tradeGui.Frame.ConfirmationFrame:FindFirstChild("YouIcon")
+                        if cIcon then
+                            if cap.icon then
+                                cIcon.Image = cap.icon
+                                cIcon.Visible = true
+                            else
+                                cIcon.Visible = false
+                            end
+                        end
+                    end
+                end)
+
+                -- Apply in-world badge above your name using ClientData.predict
+                pcall(function()
+                    if cap.tag then
+                        ClientData.predict("player_tags", {cap.tag})
+                    else
+                        ClientData.predict("player_tags", {})
+                    end
+                end)
+            end)
+        end
+
+        local dropOpen = false
+        dropToggle.MouseButton1Click:Connect(function()
+            dropOpen = not dropOpen
+            dropList.Visible = dropOpen
+            dtArrow.Text = dropOpen and "▴" or "▾"
+        end)
+    end
+
+    -- Section label
+    local secLabel = Instance.new("TextLabel")
+    secLabel.Size = UDim2.new(1,0,0,13); secLabel.BackgroundTransparency = 1
+    secLabel.Text = "Badge Icon Pet"; secLabel.Font = Enum.Font.SourceSansSemibold
+    secLabel.TextSize = 11; secLabel.TextColor3 = Color3.fromRGB(180,180,180)
+    secLabel.TextXAlignment = Enum.TextXAlignment.Left; secLabel.LayoutOrder = 1
+    secLabel.Parent = miscFrame
+
+    -- Dropdown toggle button — shows current pet name + arrow
+    local dropToggle = Instance.new("TextButton")
+    dropToggle.Size = UDim2.new(1,0,0,22); dropToggle.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    dropToggle.Text = ""; dropToggle.LayoutOrder = 2; dropToggle.Parent = miscFrame
+    Instance.new("UICorner", dropToggle).CornerRadius = UDim.new(0,4)
+    local dtStroke = Instance.new("UIStroke"); dtStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    dtStroke.Color = Color3.fromRGB(108,75,171); dtStroke.Thickness = 1.5; dtStroke.Transparency = 0.3; dtStroke.Parent = dropToggle
+
+    local dtImg = Instance.new("ImageLabel"); dtImg.Size = UDim2.new(0,16,0,16)
+    dtImg.Position = UDim2.new(0,4,0.5,-8); dtImg.BackgroundTransparency = 1
+    dtImg.ScaleType = Enum.ScaleType.Fit; dtImg.Image = BADGE_IMAGE; dtImg.Parent = dropToggle
+
+    local dtLabel = Instance.new("TextLabel"); dtLabel.Size = UDim2.new(1,-38,1,0)
+    dtLabel.Position = UDim2.new(0,24,0,0); dtLabel.BackgroundTransparency = 1
+    dtLabel.Text = "Bat Dragon"; dtLabel.Font = Enum.Font.SourceSans; dtLabel.TextSize = 11
+    dtLabel.TextColor3 = Color3.fromRGB(220,220,235); dtLabel.TextXAlignment = Enum.TextXAlignment.Left
+    dtLabel.TextTruncate = Enum.TextTruncate.AtEnd; dtLabel.Parent = dropToggle
+
+    local dtArrow = Instance.new("TextLabel"); dtArrow.Size = UDim2.new(0,14,1,0)
+    dtArrow.Position = UDim2.new(1,-16,0,0); dtArrow.BackgroundTransparency = 1
+    dtArrow.Text = "▾"; dtArrow.Font = Enum.Font.GothamBold; dtArrow.TextSize = 10
+    dtArrow.TextColor3 = Color3.fromRGB(180,180,180); dtArrow.Parent = dropToggle
+
+    -- Search box (hidden until dropdown open)
+    local searchBox = Instance.new("TextBox"); searchBox.Size = UDim2.new(1,0,0,22)
+    searchBox.BackgroundColor3 = Color3.fromRGB(40,40,50); searchBox.Text = ""
+    searchBox.PlaceholderText = "Search pet..."; searchBox.Font = Enum.Font.SourceSans
+    searchBox.TextSize = 11; searchBox.TextColor3 = Color3.fromRGB(255,255,255)
+    searchBox.PlaceholderColor3 = Color3.fromRGB(100,100,120); searchBox.ClearTextOnFocus = false
+    searchBox.TextXAlignment = Enum.TextXAlignment.Left; searchBox.LayoutOrder = 3
+    searchBox.Visible = false; searchBox.Parent = miscFrame
+    Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0,4)
+    local sbPad = Instance.new("UIPadding"); sbPad.PaddingLeft = UDim.new(0,6); sbPad.PaddingRight = UDim.new(0,6); sbPad.Parent = searchBox
+    local sbStroke = Instance.new("UIStroke"); sbStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    sbStroke.Color = Color3.fromRGB(108,75,171); sbStroke.Thickness = 1; sbStroke.Transparency = 0.3; sbStroke.Parent = searchBox
+
+    -- Scrollable pet list (hidden until open)
+    local dropScroll = Instance.new("ScrollingFrame"); dropScroll.Size = UDim2.new(1,0,0,180)
+    dropScroll.BackgroundColor3 = Color3.fromRGB(25,25,35); dropScroll.BackgroundTransparency = 0.3
+    dropScroll.BorderSizePixel = 0; dropScroll.ScrollBarThickness = 3
+    dropScroll.ScrollBarImageColor3 = Color3.fromRGB(100,100,100)
+    dropScroll.CanvasSize = UDim2.new(0,0,0,0); dropScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    dropScroll.LayoutOrder = 4; dropScroll.Visible = false; dropScroll.Parent = miscFrame
+    Instance.new("UICorner", dropScroll).CornerRadius = UDim.new(0,5)
+    local dlLayout = Instance.new("UIListLayout"); dlLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    dlLayout.Padding = UDim.new(0,3); dlLayout.Parent = dropScroll
+    local dlPad = Instance.new("UIPadding"); dlPad.PaddingTop = UDim.new(0,4); dlPad.PaddingBottom = UDim.new(0,4)
+    dlPad.PaddingLeft = UDim.new(0,4); dlPad.PaddingRight = UDim.new(0,4); dlPad.Parent = dropScroll
+
+    -- Build pet list
+    local petList = {}
+    pcall(function()
+        local ItemDB = load("ItemDB")
+        if ItemDB and ItemDB.pets then
+            for id, v in pairs(ItemDB.pets) do
+                local img = v.image or v.thumbnail or v.icon
+                if img and v.name then
+                    table.insert(petList, { name = v.name, id = id, image = tostring(img) })
+                end
+            end
+        end
+    end)
+    table.sort(petList, function(a,b) return a.name < b.name end)
+
+    local allButtons = {}
+    for i, entry in ipairs(petList) do
+        local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1,-4,0,22)
+        btn.BackgroundColor3 = Color3.fromRGB(40,40,50); btn.BackgroundTransparency = 0.2
+        btn.Text = ""; btn.LayoutOrder = i; btn.Parent = dropScroll
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+
+        local bImg = Instance.new("ImageLabel"); bImg.Size = UDim2.new(0,16,0,16)
+        bImg.Position = UDim2.new(0,3,0.5,-8); bImg.BackgroundTransparency = 1
+        bImg.ScaleType = Enum.ScaleType.Fit; bImg.Image = entry.image; bImg.Parent = btn
+
+        local bLbl = Instance.new("TextLabel"); bLbl.Size = UDim2.new(1,-24,1,0)
+        bLbl.Position = UDim2.new(0,22,0,0); bLbl.BackgroundTransparency = 1
+        bLbl.Text = entry.name; bLbl.Font = Enum.Font.SourceSans; bLbl.TextSize = 11
+        bLbl.TextColor3 = Color3.fromRGB(220,220,235); bLbl.TextXAlignment = Enum.TextXAlignment.Left
+        bLbl.TextTruncate = Enum.TextTruncate.AtEnd; bLbl.Parent = btn
+
+        btn.MouseEnter:Connect(function() TweenService:Create(btn, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(55,50,75) }):Play() end)
+        btn.MouseLeave:Connect(function() TweenService:Create(btn, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(40,40,50) }):Play() end)
+
+        local cap = entry
+        btn.MouseButton1Click:Connect(function()
+            BADGE_IMAGE = cap.image
+            dtImg.Image = BADGE_IMAGE
+            dtLabel.Text = cap.name
+            -- Close dropdown
+            dropScroll.Visible = false; searchBox.Visible = false
+            dtArrow.Text = "▾"
+            -- Auto-update badge in active trade
+            pcall(function()
+                local tradeGui = Players.LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+                if tradeGui and mockState and mockState.active then
+                    local icon = tradeGui.Frame.NegotiationFrame.Header.YouFrame.Icon
+                    icon.Image = BADGE_IMAGE; icon.Visible = true; icon.ImageTransparency = 0; icon.ImageColor3 = Color3.new(1,1,1); icon.Size = UDim2.new(0,30,0,30)
+                end
+            end)
+            if HintApp then HintApp:hint({ text = "Badge: " .. cap.name, length = 2, overridable = true }) end
+        end)
+
+        table.insert(allButtons, { btn = btn, name = entry.name:lower() })
+    end
+
+    -- Toggle open/close
+    local dropOpen = false
+    dropToggle.MouseButton1Click:Connect(function()
+        dropOpen = not dropOpen
+        dropScroll.Visible = dropOpen; searchBox.Visible = dropOpen
+        dtArrow.Text = dropOpen and "▴" or "▾"
+        if dropOpen then searchBox.Text = "" end
+        -- show all on open
+        for _, ref in ipairs(allButtons) do ref.btn.Visible = true end
+    end)
+
+    -- Filter
+    searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        local q = searchBox.Text:lower()
+        for _, ref in ipairs(allButtons) do
+            ref.btn.Visible = q == "" or ref.name:find(q, 1, true) ~= nil
+        end
+    end)
+
+    -- Suggest button text setting
+    local suggestLabel = Instance.new("TextLabel")
+    suggestLabel.Size = UDim2.new(1,0,0,13); suggestLabel.BackgroundTransparency = 1
+    suggestLabel.Text = "Suggest Button Text"; suggestLabel.Font = Enum.Font.SourceSansSemibold
+    suggestLabel.TextSize = 11; suggestLabel.TextColor3 = Color3.fromRGB(180,180,180)
+    suggestLabel.TextXAlignment = Enum.TextXAlignment.Left; suggestLabel.LayoutOrder = 10
+    suggestLabel.Parent = miscFrame
+
+end
+do -- misc sub
+    -- ── Spam Dialog ────────────────────────────────────────────────────
+    local SPAM_PRESETS = {
+        "An Adopt Me admin gave you: ",
+        "Adopt Me! has partnered with StarPets and given you: ",
+        "Thank you for buying from the tropicaljules shop! Here's your pet: ",
+        "JesseRaen and NewFissy have given you a PERMANENT: ",
+    }
+    local spamActive = false
+    local spamThread = nil
+    local currentDialogMsg = SPAM_PRESETS[1]
+
+    local function doSpamDialog()
+        while spamActive do
+            pcall(function()
+                pcall(setthreadidentity, 2)
+                local petName = HIGH_TIER_PETS[math.random(1, #HIGH_TIER_PETS)]
+                local petId, kd
+                for id, item in pairs(InventoryDB.pets or {}) do
+                    if item.name and item.name:lower() == petName:lower() then
+                        petId = id; kd = load("KindDB")[id]; break
+                    end
+                end
+                if not petId or not kd then return end
+                local v = math.random(1,12)
+                DialogApp:dialog({
+                    dialog_type = "ItemPreviewDialog",
+                    text = currentDialogMsg .. petName,
+                    item = {
+                        id = petId, name = petName, category = "pets", kind = kd.kind or petId,
+                        properties = {
+                            pet_trick_level = math.random(1,5),
+                            neon = v>=5 and v<=8, mega_neon = v>=1 and v<=4,
+                            flyable = v==1 or v==3 or v==5 or v==6 or v==9 or v==10,
+                            rideable = v==1 or v==2 or v==5 or v==7 or v==9 or v==11,
+                            age = math.random(1,900000), ailments_completed=0, rp_name=""
+                        }
+                    },
+                    button = "Okay!",
+                    yields = true
+                })
+                pcall(setthreadidentity, 8)
+            end)
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    local spamRow = Instance.new("Frame")
+    spamRow.Size = UDim2.new(1,0,0,22); spamRow.BackgroundTransparency = 1
+    spamRow.LayoutOrder = 6; spamRow.Parent = miscFrame
+    local spamRowLayout = Instance.new("UIListLayout"); spamRowLayout.FillDirection = Enum.FillDirection.Horizontal
+    spamRowLayout.Padding = UDim.new(0,3); spamRowLayout.SortOrder = Enum.SortOrder.LayoutOrder; spamRowLayout.Parent = spamRow
+
+    local spamToggle = Instance.new("TextButton")
+    spamToggle.Size = UDim2.new(0.42,0,1,0); spamToggle.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    spamToggle.Text = "Spam: OFF"; spamToggle.Font = Enum.Font.FredokaOne; spamToggle.TextSize = 10
+    spamToggle.TextColor3 = Color3.fromRGB(255,255,255); spamToggle.LayoutOrder = 1; spamToggle.Parent = spamRow
+    Instance.new("UICorner", spamToggle).CornerRadius = UDim.new(0,4)
+    local spamStroke = Instance.new("UIStroke"); spamStroke.Color = Color3.fromRGB(108,75,171)
+    spamStroke.Thickness = 1.5; spamStroke.Transparency = 0.2; spamStroke.Parent = spamToggle
+
+    local spamMsgBox = Instance.new("TextBox")
+    spamMsgBox.Size = UDim2.new(0.45,0,1,0); spamMsgBox.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    spamMsgBox.Text = currentDialogMsg; spamMsgBox.PlaceholderText = "Enter custom dialog message"
+    spamMsgBox.Font = Enum.Font.SourceSans; spamMsgBox.TextSize = 9
+    spamMsgBox.TextColor3 = Color3.fromRGB(255,255,255); spamMsgBox.PlaceholderColor3 = Color3.fromRGB(100,100,120)
+    spamMsgBox.ClearTextOnFocus = false; spamMsgBox.TextXAlignment = Enum.TextXAlignment.Left
+    spamMsgBox.LayoutOrder = 2; spamMsgBox.Parent = spamRow
+    Instance.new("UICorner", spamMsgBox).CornerRadius = UDim.new(0,4)
+    local spamBoxStroke = Instance.new("UIStroke"); spamBoxStroke.Color = Color3.fromRGB(108,75,171)
+    spamBoxStroke.Thickness = 1; spamBoxStroke.Transparency = 0.4; spamBoxStroke.Parent = spamMsgBox
+    local spamBoxPad = Instance.new("UIPadding"); spamBoxPad.PaddingLeft = UDim.new(0,5); spamBoxPad.PaddingRight = UDim.new(0,5); spamBoxPad.Parent = spamMsgBox
+    spamMsgBox.FocusLost:Connect(function() if spamMsgBox.Text ~= "" then currentDialogMsg = spamMsgBox.Text end end)
+
+    local spamDropBtn = Instance.new("TextButton")
+    spamDropBtn.Size = UDim2.new(0.12,0,1,0); spamDropBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    spamDropBtn.Text = "▾"; spamDropBtn.Font = Enum.Font.GothamBold; spamDropBtn.TextSize = 11
+    spamDropBtn.TextColor3 = Color3.fromRGB(200,180,255); spamDropBtn.LayoutOrder = 3; spamDropBtn.Parent = spamRow
+    Instance.new("UICorner", spamDropBtn).CornerRadius = UDim.new(0,4)
+    Instance.new("UIStroke", spamDropBtn).Color = Color3.fromRGB(108,75,171)
+
+    -- Preset list
+    local spamPresetList = Instance.new("Frame")
+    spamPresetList.Size = UDim2.new(1,0,0,0); spamPresetList.BackgroundColor3 = Color3.fromRGB(25,25,35)
+    spamPresetList.BackgroundTransparency = 0.3; spamPresetList.BorderSizePixel = 0
+    spamPresetList.Visible = false; spamPresetList.LayoutOrder = 6; spamPresetList.AutomaticSize = Enum.AutomaticSize.Y
+    spamPresetList.Parent = miscFrame
+    Instance.new("UICorner", spamPresetList).CornerRadius = UDim.new(0,5)
+    local spl = Instance.new("UIListLayout"); spl.SortOrder = Enum.SortOrder.LayoutOrder; spl.Padding = UDim.new(0,2); spl.Parent = spamPresetList
+    local spp = Instance.new("UIPadding"); spp.PaddingTop = UDim.new(0,4); spp.PaddingBottom = UDim.new(0,4)
+    spp.PaddingLeft = UDim.new(0,4); spp.PaddingRight = UDim.new(0,4); spp.Parent = spamPresetList
+
+    for i, msg in ipairs(SPAM_PRESETS) do
+        local pb = Instance.new("TextButton"); pb.Size = UDim2.new(1,-4,0,20); pb.BackgroundColor3 = Color3.fromRGB(40,40,55)
+        pb.BackgroundTransparency = 0.2; pb.Text = msg; pb.Font = Enum.Font.SourceSans; pb.TextSize = 10
+        pb.TextColor3 = Color3.fromRGB(220,220,235); pb.TextXAlignment = Enum.TextXAlignment.Left
+        pb.TextTruncate = Enum.TextTruncate.AtEnd; pb.LayoutOrder = i; pb.Parent = spamPresetList
+        Instance.new("UICorner", pb).CornerRadius = UDim.new(0,4)
+        local pbs = Instance.new("UIStroke"); pbs.Color = Color3.fromRGB(108,75,171); pbs.Thickness = 1; pbs.Transparency = 0.6; pbs.Parent = pb
+        local captMsg = msg
+        pb.MouseButton1Click:Connect(function()
+            currentDialogMsg = captMsg; spamMsgBox.Text = captMsg
+            spamPresetList.Visible = false; spamDropBtn.Text = "▾"
+        end)
+        pb.MouseEnter:Connect(function() TweenService:Create(pb,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(55,50,75)}):Play() end)
+        pb.MouseLeave:Connect(function() TweenService:Create(pb,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(40,40,55)}):Play() end)
+    end
+
+    local spamDropOpen = false
+    spamDropBtn.MouseButton1Click:Connect(function()
+        spamDropOpen = not spamDropOpen
+        spamPresetList.Visible = spamDropOpen; spamDropBtn.Text = spamDropOpen and "▴" or "▾"
+    end)
+
+    spamToggle.MouseButton1Click:Connect(function()
+        spamActive = not spamActive
+        if spamActive then
+            spamToggle.Text = "Spam: ON"
+            TweenService:Create(spamToggle,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(55,45,75)}):Play()
+            TweenService:Create(spamStroke,TweenInfo.new(0.15),{Thickness=2}):Play()
+            spamThread = task.spawn(doSpamDialog)
+        else
+            spamToggle.Text = "Spam: OFF"
+            TweenService:Create(spamToggle,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(35,35,48)}):Play()
+            TweenService:Create(spamStroke,TweenInfo.new(0.15),{Thickness=1.5}):Play()
+            if spamThread then task.cancel(spamThread); spamThread = nil end
+        end
+    end)
+    local ADMIN_COLOR  = "#DD99FF"
+    local ANNOUNCE_MESSAGES = {
+        "This live creator is sponsored by StarPets!",
+        "This live creator is an Adopt Me Admin!",
+        "This live creator is an Adopt Me Influencer!",
+        "This live creator is trusted by Adopt Me!",
+        "This live creator is endorsed by Adopt Me!",
+        "Make sure to like the live for your dream pet!",
+        "Make sure to follow for your dream pet!",
+        "Top liker gets a Mega Bat Dragon!",
+        "Make sure to add me!",
+    }
+    local announcementGui = nil
+    local currentAnimTrack = nil
+
+    local function clearAnnouncement()
+        currentAnimTrack = nil
+        if announcementGui then announcementGui:Destroy(); announcementGui = nil end
+    end
+
+    local function showAnnouncement(username, message)
+        clearAnnouncement()
+        local richText = ('<font color="%s">%s:</font> %s'):format(ADMIN_COLOR, username, message)
+        announcementGui = Instance.new("ScreenGui")
+        announcementGui.Name = "AdminAnnouncementDisplay"; announcementGui.ResetOnSpawn = false
+        announcementGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        announcementGui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+        local anchor = Instance.new("Frame")
+        anchor.BackgroundTransparency = 1; anchor.Size = UDim2.fromScale(1,1)
+        anchor.AnchorPoint = Vector2.new(0.5,1); anchor.Position = UDim2.new(0.5,0,1,-170)
+        anchor.Parent = announcementGui
+        local aL = Instance.new("UIListLayout"); aL.SortOrder = Enum.SortOrder.LayoutOrder
+        aL.FillDirection = Enum.FillDirection.Vertical; aL.VerticalAlignment = Enum.VerticalAlignment.Bottom
+        aL.HorizontalAlignment = Enum.HorizontalAlignment.Center; aL.Parent = anchor
+
+        -- Viewport with dancing avatar
+        local vpC = Instance.new("Frame"); vpC.LayoutOrder = 1; vpC.BackgroundTransparency = 1
+        vpC.Size = UDim2.fromOffset(150,150); vpC.Parent = anchor
+        local vp = Instance.new("ViewportFrame"); vp.Size = UDim2.fromOffset(150,150)
+        vp.BackgroundTransparency = 1; vp.LightDirection = Vector3.new(10,-10,6)
+        vp.Ambient = Color3.fromRGB(213,190,171); vp.LightColor = Color3.fromRGB(255,248,226); vp.Parent = vpC
+        local wm = Instance.new("WorldModel"); wm.Parent = vp
+        local cam = Instance.new("Camera"); cam.CFrame = CFrame.new(0,2,5); cam.FieldOfView = 50
+        vp.CurrentCamera = cam; cam.Parent = vp
+        task.spawn(function()
+            local ok, uid = pcall(function() return Players:GetUserIdFromNameAsync(username) end)
+            if not ok or not uid then return end
+            local ok2, desc = pcall(function() return Players:GetHumanoidDescriptionFromUserId(uid) end)
+            if not ok2 or not desc then return end
+            local ok3, model = pcall(function() return Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15) end)
+            if not ok3 or not model then return end
+            -- Remove Animate and all LocalScripts — they crash inside WorldModel/ViewportFrame
+            for _, s in ipairs(model:GetDescendants()) do
+                if s:IsA("LocalScript") or s:IsA("Script") then
+                    s:Destroy()
+                end
+            end
+            local hrp = model:FindFirstChild("HumanoidRootPart")
+            if hrp then hrp.CFrame = CFrame.fromAxisAngle(Vector3.new(0,1,0), math.pi); hrp.Anchored = true end
+            -- Anchor every BasePart so physics don't interfere inside the ViewportFrame
+            for _, p in ipairs(model:GetDescendants()) do
+                if p:IsA("BasePart") then p.Anchored = true end
+            end
+            if not vp.Parent then return end
+            model.Parent = wm
+            -- Remove any Animate/LocalScript Roblox injects after parenting
+            task.defer(function()
+                for _, s in ipairs(model:GetDescendants()) do
+                    if s:IsA("LocalScript") or s:IsA("Script") then
+                        pcall(function() s:Destroy() end)
+                    end
+                end
+            end)
+            local hum = model:FindFirstChildWhichIsA("Humanoid")
+            if hum then
+                hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+                hum:ChangeState(Enum.HumanoidStateType.None)
+                local animator = hum:FindFirstChildWhichIsA("Animator")
+                if not animator then
+                    animator = Instance.new("Animator")
+                    animator.Parent = hum
+                end
+                local anim = Instance.new("Animation"); anim.AnimationId = "rbxassetid://3154625987"
+                local ok4, track = pcall(function() return animator:LoadAnimation(anim) end)
+                if ok4 and track then
+                    currentAnimTrack = track
+                    currentAnimTrack.Looped = true; currentAnimTrack:Play()
+                end
+            end
+        end)
+
+        local lbl = Instance.new("TextLabel"); lbl.LayoutOrder = 2; lbl.BackgroundTransparency = 0.75
+        lbl.TextWrapped = true; lbl.RichText = true; lbl.AutoLocalize = false
+        lbl.Size = UDim2.fromScale(1,0); lbl.AutomaticSize = Enum.AutomaticSize.Y
+        lbl.BackgroundColor3 = Color3.new(0,0,0); lbl.Font = Enum.Font.FredokaOne
+        lbl.TextColor3 = Color3.new(1,1,1); lbl.Text = richText; lbl.TextSize = 24
+        lbl.Parent = anchor
+        local lp = Instance.new("UIPadding"); lp.PaddingTop = UDim.new(0,8); lp.PaddingBottom = UDim.new(0,8)
+        lp.PaddingLeft = UDim.new(0.15,0); lp.PaddingRight = UDim.new(0.15,0); lp.Parent = lbl
+        Instance.new("UIStroke", lbl).Thickness = 2
+    end
+
+    -- Announcement row: [Show: OFF] [username box] [▼]
+    local annRow = Instance.new("Frame")
+    annRow.Size = UDim2.new(1,0,0,22); annRow.BackgroundTransparency = 1
+    annRow.LayoutOrder = 7; annRow.Parent = miscFrame
+    local annRowLayout = Instance.new("UIListLayout"); annRowLayout.FillDirection = Enum.FillDirection.Horizontal
+    annRowLayout.Padding = UDim.new(0,3); annRowLayout.SortOrder = Enum.SortOrder.LayoutOrder; annRowLayout.Parent = annRow
+
+    local annShowBtn = Instance.new("TextButton")
+    annShowBtn.Size = UDim2.new(0.42,0,1,0); annShowBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    annShowBtn.Text = "Announcement: OFF"; annShowBtn.Font = Enum.Font.FredokaOne; annShowBtn.TextSize = 9
+    annShowBtn.TextColor3 = Color3.fromRGB(255,255,255); annShowBtn.LayoutOrder = 1; annShowBtn.Parent = annRow
+    Instance.new("UICorner", annShowBtn).CornerRadius = UDim.new(0,4)
+    local annStroke = Instance.new("UIStroke"); annStroke.Color = Color3.fromRGB(108,75,171)
+    annStroke.Thickness = 1.5; annStroke.Transparency = 0.2; annStroke.Parent = annShowBtn
+
+    local annUserBox = Instance.new("TextBox")
+    annUserBox.Size = UDim2.new(0.45,0,1,0); annUserBox.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    annUserBox.Text = ""; annUserBox.PlaceholderText = "Username..."
+    annUserBox.Font = Enum.Font.SourceSans; annUserBox.TextSize = 11
+    annUserBox.TextColor3 = Color3.fromRGB(255,255,255); annUserBox.PlaceholderColor3 = Color3.fromRGB(100,100,120)
+    annUserBox.ClearTextOnFocus = false; annUserBox.LayoutOrder = 2; annUserBox.Parent = annRow
+    Instance.new("UICorner", annUserBox).CornerRadius = UDim.new(0,4)
+    local annBoxStroke = Instance.new("UIStroke"); annBoxStroke.Color = Color3.fromRGB(108,75,171)
+    annBoxStroke.Thickness = 1; annBoxStroke.Transparency = 0.4; annBoxStroke.Parent = annUserBox
+    local annBoxPad = Instance.new("UIPadding"); annBoxPad.PaddingLeft = UDim.new(0,5); annBoxPad.PaddingRight = UDim.new(0,5); annBoxPad.Parent = annUserBox
+
+    local annDropBtn = Instance.new("TextButton")
+    annDropBtn.Size = UDim2.new(0.12,0,1,0); annDropBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    annDropBtn.Text = "▾"; annDropBtn.Font = Enum.Font.GothamBold; annDropBtn.TextSize = 11
+    annDropBtn.TextColor3 = Color3.fromRGB(200,180,255); annDropBtn.LayoutOrder = 3; annDropBtn.Parent = annRow
+    Instance.new("UICorner", annDropBtn).CornerRadius = UDim.new(0,4)
+    Instance.new("UIStroke", annDropBtn).Color = Color3.fromRGB(108,75,171)
+
+    -- Message list (hidden)
+    local annMsgList = Instance.new("Frame")
+    annMsgList.Size = UDim2.new(1,0,0,0); annMsgList.BackgroundColor3 = Color3.fromRGB(25,25,35)
+    annMsgList.BackgroundTransparency = 0.3; annMsgList.BorderSizePixel = 0
+    annMsgList.Visible = false; annMsgList.LayoutOrder = 8; annMsgList.AutomaticSize = Enum.AutomaticSize.Y
+    annMsgList.Parent = miscFrame
+    Instance.new("UICorner", annMsgList).CornerRadius = UDim.new(0,5)
+    local aml = Instance.new("UIListLayout"); aml.SortOrder = Enum.SortOrder.LayoutOrder; aml.Padding = UDim.new(0,2); aml.Parent = annMsgList
+    local amp = Instance.new("UIPadding"); amp.PaddingTop = UDim.new(0,4); amp.PaddingBottom = UDim.new(0,4)
+    amp.PaddingLeft = UDim.new(0,4); amp.PaddingRight = UDim.new(0,4); amp.Parent = annMsgList
+
+    for i, msg in ipairs(ANNOUNCE_MESSAGES) do
+        local mb = Instance.new("TextButton"); mb.Size = UDim2.new(1,-4,0,20); mb.BackgroundColor3 = Color3.fromRGB(40,40,55)
+        mb.BackgroundTransparency = 0.2; mb.Text = msg; mb.Font = Enum.Font.SourceSans; mb.TextSize = 10
+        mb.TextColor3 = Color3.fromRGB(220,220,235); mb.TextXAlignment = Enum.TextXAlignment.Left
+        mb.TextTruncate = Enum.TextTruncate.AtEnd; mb.LayoutOrder = i; mb.Parent = annMsgList
+        Instance.new("UICorner", mb).CornerRadius = UDim.new(0,4)
+        local mbs = Instance.new("UIStroke"); mbs.Color = Color3.fromRGB(108,75,171); mbs.Thickness = 1; mbs.Transparency = 0.6; mbs.Parent = mb
+        local captMsg = msg
+        mb.MouseButton1Click:Connect(function()
+            annUserBox.Text = annUserBox.Text ~= "" and annUserBox.Text or Players.LocalPlayer.Name
+            local user = annUserBox.Text ~= "" and annUserBox.Text or Players.LocalPlayer.Name
+            showAnnouncement(user, captMsg)
+            annMsgList.Visible = false; annDropBtn.Text = "▾"
+            TweenService:Create(annStroke, TweenInfo.new(0.15), { Thickness = 2 }):Play()
+            TweenService:Create(annShowBtn, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(55,45,75) }):Play()
+            annShowBtn.Text = "Announcement: ON"
+        end)
+        mb.MouseEnter:Connect(function() TweenService:Create(mb, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(55,50,75) }):Play() end)
+        mb.MouseLeave:Connect(function() TweenService:Create(mb, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(40,40,55) }):Play() end)
+    end
+
+    -- Toggle dropdown
+    local annDropOpen = false
+    annDropBtn.MouseButton1Click:Connect(function()
+        annDropOpen = not annDropOpen
+        annMsgList.Visible = annDropOpen; annDropBtn.Text = annDropOpen and "▴" or "▾"
+    end)
+
+    -- Toggle show/clear
+    local annOn = false
+    annShowBtn.MouseButton1Click:Connect(function()
+        annOn = not annOn
+        if annOn then
+            local user = annUserBox.Text ~= "" and annUserBox.Text or Players.LocalPlayer.Name
+            showAnnouncement(user, ANNOUNCE_MESSAGES[1])
+            annShowBtn.Text = "Announcement: ON"
+            TweenService:Create(annShowBtn, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(55,45,75) }):Play()
+            TweenService:Create(annStroke, TweenInfo.new(0.15), { Thickness = 2 }):Play()
+        else
+            clearAnnouncement()
+            annShowBtn.Text = "Announcement: OFF"
+            TweenService:Create(annShowBtn, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(35,35,48) }):Play()
+            TweenService:Create(annStroke, TweenInfo.new(0.15), { Thickness = 1.5 }):Play()
+        end
+    end)
+
+end
+do -- misc sub
+    -- ── Richest Player ────────────────────────────────────────────────
+    local richestPlayer = nil -- { player, value, name }
+
+    local function findRichestPlayer()
+        local best = nil; local bestVal = -1
+        local allPlayers = Players:GetPlayers()
+        -- scan all players' profiles in parallel
+        local results = {}
+        local pending = #allPlayers
+        if pending == 0 then return nil end
+        for _, p in ipairs(allPlayers) do
+            if p == Players.LocalPlayer then pending = pending - 1; continue end
+            task.spawn(function()
+                local ok, col = pcall(GetPlayerCollectionPets, p)
+                local val = 0
+                if ok and col and col.pets then
+                    val = calcCollectionValue(col.pets)
+                end
+                results[p.UserId] = { player = p, value = val, name = p.Name }
+                pending = pending - 1
+            end)
+        end
+        local t0 = tick()
+        while pending > 0 and tick()-t0 < 8 do task.wait(0.1) end
+        for _, r in pairs(results) do
+            if r.value > bestVal then bestVal = r.value; best = r end
+        end
+        return best
+    end
+
+    local richestRow = Instance.new("Frame")
+    richestRow.Size = UDim2.new(1,0,0,22); richestRow.BackgroundTransparency = 1
+    richestRow.LayoutOrder = 5; richestRow.Parent = miscFrame
+    local rrLayout = Instance.new("UIListLayout"); rrLayout.FillDirection = Enum.FillDirection.Horizontal
+    rrLayout.Padding = UDim.new(0,3); rrLayout.SortOrder = Enum.SortOrder.LayoutOrder; rrLayout.Parent = richestRow
+
+    local function makeRichBtn(label, order)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.5,-2,1,0); btn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        btn.Text = label; btn.Font = Enum.Font.FredokaOne; btn.TextSize = 9
+        btn.TextColor3 = Color3.fromRGB(255,255,255); btn.LayoutOrder = order; btn.Parent = richestRow
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+        local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(108,75,171); s.Thickness = 1.5; s.Transparency = 0.2; s.Parent = btn
+        return btn
+    end
+
+    local tradeRichestBtn  = makeRichBtn("Trade Richest Player", 1)
+    local profileRichestBtn = makeRichBtn("Richest Player Profile", 2)
+
+    local function getRichest(cb)
+        if richestPlayer then cb(richestPlayer); return end
+        tradeRichestBtn.Text = "Scanning..."
+        profileRichestBtn.Text = "Scanning..."
+        task.spawn(function()
+            richestPlayer = findRichestPlayer()
+            tradeRichestBtn.Text = "Trade Richest Player"
+            profileRichestBtn.Text = "Richest Player Profile"
+            cb(richestPlayer)
+        end)
+    end
+
+    -- Invalidate cache when players join/leave
+    Players.PlayerAdded:Connect(function() richestPlayer = nil end)
+    Players.PlayerRemoving:Connect(function() richestPlayer = nil end)
+
+    tradeRichestBtn.MouseButton1Click:Connect(function()
+        getRichest(function(r)
+            if not r then
+                if HintApp then HintApp:hint({ text = "No players found.", length = 3, overridable = true }) end
+                return
+            end
+            sendTradeRequest(r.player)
+        end)
+    end)
+
+    profileRichestBtn.MouseButton1Click:Connect(function()
+        getRichest(function(r)
+            if not r then
+                if HintApp then HintApp:hint({ text = "No players found.", length = 3, overridable = true }) end
+                return
+            end
+            pcall(function()
+                UIManager.apps.PlayerProfileApp:open_player_profile_for_user_id(r.player.UserId)
+            end)
+        end)
+    end)
+
+end
+do -- misc sub
+    -- ── Anti-Raid ─────────────────────────────────────────────────────
+    local SCAM_KEYWORDS = {
+        "scam","scammer","scammed","hack","hacker","hacked","report","ban",
+        "banned","free","giveaway","admin","mods","cheat","cheater","rat",
+        "virus","scamming","liar","lie","lied","steal","stolen","stole","fake"
+    }
+    local function containsScamWord(str)
+        if not str or str == "" then return nil end
+        local s = str:lower()
+        for _, w in ipairs(SCAM_KEYWORDS) do
+            if s:find(w, 1, true) then return w end
+        end
+        return nil
+    end
+
+    local antiRaidOn = false
+    local flaggedPlayers = {}
+    local antiRaidListOpen = false
+
+    -- Check a player's inventory for scam pet names
+    local function checkInventory(player, inventory)
+        if not antiRaidOn then return end
+        if player == Players.LocalPlayer then return end
+        if not inventory or type(inventory) ~= "table" then return end
+        -- Walk all pets in inventory and check rp_name
+        local function scanPets(t, depth)
+            if depth > 5 or type(t) ~= "table" then return end
+            for k, v in pairs(t) do
+                if k == "rp_name" and type(v) == "string" and v ~= "" then
+                    local word = containsScamWord(v)
+                    if word and not flaggedPlayers[player.UserId] then
+                        flaggedPlayers[player.UserId] = { name = player.Name, reason = v, petName = word }
+                        if antiRaidListOpen then rebuildFlaggedList() end
+                    end
+                elseif type(v) == "table" then
+                    scanPets(v, depth + 1)
+                end
+            end
+        end
+        scanPets(inventory, 0)
+    end
+
+    -- Watch a character for pet nametag BillboardGuis
+    local function checkInstance(player, inst)
+        if not antiRaidOn then return end
+        if player == Players.LocalPlayer then return end
+        -- Pet nametags show as BillboardGui with a TextLabel inside
+        if inst:IsA("BillboardGui") or inst:IsA("TextLabel") or inst:IsA("StringValue") then
+            local text = (inst:IsA("TextLabel") and inst.Text)
+                or (inst:IsA("StringValue") and inst.Value)
+                or inst.Name
+            if text and text ~= "" then
+                local word = containsScamWord(text)
+                if word and not flaggedPlayers[player.UserId] then
+                    flaggedPlayers[player.UserId] = { name = player.Name, reason = text, petName = word }
+                    if antiRaidListOpen then rebuildFlaggedList() end
+                end
+            end
+            -- Also check children of BillboardGui
+            if inst:IsA("BillboardGui") then
+                for _, child in ipairs(inst:GetDescendants()) do
+                    if child:IsA("TextLabel") and child.Text ~= "" then
+                        local word = containsScamWord(child.Text)
+                        if word and not flaggedPlayers[player.UserId] then
+                            flaggedPlayers[player.UserId] = { name = player.Name, reason = child.Text, petName = word }
+                            if antiRaidListOpen then rebuildFlaggedList() end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local antiRaidConns = {}
+    local function watchCharacter(player, char)
+        -- Scan existing descendants
+        for _, desc in ipairs(char:GetDescendants()) do
+            checkInstance(player, desc)
+        end
+        -- Watch for new descendants
+        local c = char.DescendantAdded:Connect(function(desc)
+            checkInstance(player, desc)
+            -- Also watch TextLabel text changes
+            if desc:IsA("TextLabel") then
+                local c2 = desc:GetPropertyChangedSignal("Text"):Connect(function()
+                    checkInstance(player, desc)
+                end)
+                table.insert(antiRaidConns, c2)
+            end
+        end)
+        table.insert(antiRaidConns, c)
+    end
+
+    local function watchPlayer(player)
+        if player == Players.LocalPlayer then return end
+        if player.Character then watchCharacter(player, player.Character) end
+        local c = player.CharacterAdded:Connect(function(char)
+            if antiRaidOn then watchCharacter(player, char) end
+        end)
+        table.insert(antiRaidConns, c)
+    end
+
+    -- Rows table defined before rebuildFlaggedList
+    local antiRaidRow = Instance.new("Frame")
+    antiRaidRow.Size = UDim2.new(1,0,0,22); antiRaidRow.BackgroundTransparency = 1
+    antiRaidRow.LayoutOrder = 4; antiRaidRow.Parent = miscFrame
+    local arRowLayout = Instance.new("UIListLayout"); arRowLayout.FillDirection = Enum.FillDirection.Horizontal
+    arRowLayout.Padding = UDim.new(0,3); arRowLayout.SortOrder = Enum.SortOrder.LayoutOrder; arRowLayout.Parent = antiRaidRow
+
+    local antiRaidToggle = Instance.new("TextButton")
+    antiRaidToggle.Size = UDim2.new(0.85,0,1,0); antiRaidToggle.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    antiRaidToggle.Text = "Anti-Raid: OFF"; antiRaidToggle.Font = Enum.Font.FredokaOne; antiRaidToggle.TextSize = 10
+    antiRaidToggle.TextColor3 = Color3.fromRGB(255,255,255); antiRaidToggle.LayoutOrder = 1; antiRaidToggle.Parent = antiRaidRow
+    Instance.new("UICorner", antiRaidToggle).CornerRadius = UDim.new(0,4)
+    local arStroke = Instance.new("UIStroke"); arStroke.Color = Color3.fromRGB(108,75,171)
+    arStroke.Thickness = 1.5; arStroke.Transparency = 0.2; arStroke.Parent = antiRaidToggle
+
+    local antiRaidDropBtn = Instance.new("TextButton")
+    antiRaidDropBtn.Size = UDim2.new(0.14,0,1,0); antiRaidDropBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    antiRaidDropBtn.Text = "▾"; antiRaidDropBtn.Font = Enum.Font.GothamBold; antiRaidDropBtn.TextSize = 11
+    antiRaidDropBtn.TextColor3 = Color3.fromRGB(200,180,255); antiRaidDropBtn.LayoutOrder = 2; antiRaidDropBtn.Parent = antiRaidRow
+    Instance.new("UICorner", antiRaidDropBtn).CornerRadius = UDim.new(0,4)
+    Instance.new("UIStroke", antiRaidDropBtn).Color = Color3.fromRGB(108,75,171)
+
+    -- Flagged players list
+    local arList = Instance.new("Frame")
+    arList.Size = UDim2.new(1,0,0,0); arList.BackgroundColor3 = Color3.fromRGB(25,25,35)
+    arList.BackgroundTransparency = 0.3; arList.BorderSizePixel = 0
+    arList.Visible = false; arList.LayoutOrder = 4; arList.AutomaticSize = Enum.AutomaticSize.Y
+    arList.Parent = miscFrame
+    Instance.new("UICorner", arList).CornerRadius = UDim.new(0,5)
+    local arListLayout = Instance.new("UIListLayout"); arListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    arListLayout.Padding = UDim.new(0,2); arListLayout.Parent = arList
+    local arListPad = Instance.new("UIPadding"); arListPad.PaddingTop = UDim.new(0,4)
+    arListPad.PaddingBottom = UDim.new(0,4); arListPad.PaddingLeft = UDim.new(0,5)
+    arListPad.PaddingRight = UDim.new(0,5); arListPad.Parent = arList
+
+    local arEmptyLabel = Instance.new("TextLabel")
+    arEmptyLabel.Size = UDim2.new(1,0,0,16); arEmptyLabel.BackgroundTransparency = 1
+    arEmptyLabel.Text = "No flagged players"; arEmptyLabel.Font = Enum.Font.SourceSans; arEmptyLabel.TextSize = 10
+    arEmptyLabel.TextColor3 = Color3.fromRGB(120,120,140); arEmptyLabel.LayoutOrder = 0; arEmptyLabel.Parent = arList
+
+    local function rebuildFlaggedList()
+        for _, child in ipairs(arList:GetChildren()) do
+            if child:IsA("Frame") then child:Destroy() end
+        end
+        local count = 0
+        for uid, data in pairs(flaggedPlayers) do
+            count = count + 1
+            local captUid = uid
+            local row = Instance.new("Frame"); row.Size = UDim2.new(1,0,0,24); row.BackgroundColor3 = Color3.fromRGB(60,20,20)
+            row.BackgroundTransparency = 0.3; row.LayoutOrder = count; row.Parent = arList
+            Instance.new("UICorner", row).CornerRadius = UDim.new(0,4)
+            local rowLayout = Instance.new("UIListLayout"); rowLayout.FillDirection = Enum.FillDirection.Horizontal
+            rowLayout.Padding = UDim.new(0,3); rowLayout.SortOrder = Enum.SortOrder.LayoutOrder; rowLayout.VerticalAlignment = Enum.VerticalAlignment.Center; rowLayout.Parent = row
+
+            local nameLbl = Instance.new("TextLabel"); nameLbl.Size = UDim2.new(0.76,0,1,0)
+            nameLbl.BackgroundTransparency = 1
+            nameLbl.Text = data.name .. ' "' .. data.reason .. '"'
+            nameLbl.Font = Enum.Font.FredokaOne; nameLbl.TextSize = 9
+            nameLbl.TextColor3 = Color3.fromRGB(255,180,180)
+            nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+            nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+            nameLbl.LayoutOrder = 1; nameLbl.Parent = row
+
+            local blockBtn = Instance.new("TextButton"); blockBtn.Size = UDim2.new(0.22,0,0.8,0)
+            blockBtn.BackgroundColor3 = Color3.fromRGB(140,30,30); blockBtn.Text = "Block"
+            blockBtn.Font = Enum.Font.FredokaOne; blockBtn.TextSize = 9; blockBtn.TextColor3 = Color3.fromRGB(255,255,255)
+            blockBtn.LayoutOrder = 2; blockBtn.Parent = row
+            Instance.new("UICorner", blockBtn).CornerRadius = UDim.new(0,3)
+            Instance.new("UIStroke", blockBtn).Color = Color3.fromRGB(255,80,80)
+            blockBtn.MouseButton1Click:Connect(function()
+                local target = Players:GetPlayerByUserId(captUid)
+                if target then
+                    CONFIG.PARTNER_NAME = target.Name
+                    doBlockPlayer()
+                end
+            end)
+        end
+        arEmptyLabel.Visible = count == 0
+    end
+
+    local function scanGuiForScam(player, gui)
+        if not gui then return end
+        for _, desc in ipairs(gui:GetDescendants()) do
+            if desc:IsA("TextLabel") or desc:IsA("TextBox") then
+                local word = containsScamWord(desc.Text)
+                if word and not flaggedPlayers[player.UserId] then
+                    flaggedPlayers[player.UserId] = { name = player.Name, reason = desc.Text, petName = word }
+                    if antiRaidListOpen then rebuildFlaggedList() end
+                end
+                -- watch for text changes
+                local c = desc:GetPropertyChangedSignal("Text"):Connect(function()
+                    if not antiRaidOn then return end
+                    local w2 = containsScamWord(desc.Text)
+                    if w2 and not flaggedPlayers[player.UserId] then
+                        flaggedPlayers[player.UserId] = { name = player.Name, reason = desc.Text, petName = w2 }
+                        if antiRaidListOpen then rebuildFlaggedList() end
+                    end
+                end)
+                table.insert(antiRaidConns, c)
+            end
+        end
+        -- watch new descendants
+        local c2 = gui.DescendantAdded:Connect(function(desc)
+            if not antiRaidOn then return end
+            if desc:IsA("TextLabel") or desc:IsA("TextBox") then
+                local word = containsScamWord(desc.Text)
+                if word and not flaggedPlayers[player.UserId] then
+                    flaggedPlayers[player.UserId] = { name = player.Name, reason = desc.Text, petName = word }
+                    if antiRaidListOpen then rebuildFlaggedList() end
+                end
+            end
+        end)
+        table.insert(antiRaidConns, c2)
+    end
+
+    local function startAntiRaid()
+        pcall(function()
+            local CharWrapperClient = load("CharWrapperClient")
+            local EquippedPets = load("EquippedPets")
+
+            local function checkWrapper(player, wrapper, nameType)
+                if not wrapper or not wrapper.rp_name or wrapper.rp_name == "" then return end
+                if player == Players.LocalPlayer then return end
+                local word = containsScamWord(wrapper.rp_name)
+                if word and not flaggedPlayers[player.UserId] then
+                    flaggedPlayers[player.UserId] = { name = player.Name, reason = wrapper.rp_name, petName = word }
+                    if antiRaidListOpen then rebuildFlaggedList() end
+                end
+            end
+
+            local function checkPlayer(player)
+                if player == Players.LocalPlayer then return end
+                task.wait(2)
+                if player.Character then
+                    local cw = CharWrapperClient.get(player.Character)
+                    checkWrapper(player, cw, "avatar name")
+                end
+                local equipped = EquippedPets.get_equipped_char_wrappers(player)
+                if equipped then
+                    for _, petWrapper in ipairs(equipped) do
+                        checkWrapper(player, petWrapper, "pet name")
+                    end
+                end
+            end
+
+            -- Hook rp_name changes live
+            CharWrapperClient.register_property_changed("rp_name", function(char, oldName, newName)
+                if not antiRaidOn then return end
+                local cw = CharWrapperClient.get(char)
+                if not cw then return end
+                local player = cw.player
+                if not player or player == Players.LocalPlayer then return end
+                local nameType = cw.is_pet and "pet name" or "avatar name"
+                local word = containsScamWord(newName or "")
+                if word and not flaggedPlayers[player.UserId] then
+                    flaggedPlayers[player.UserId] = { name = player.Name, reason = newName, petName = word }
+                    if antiRaidListOpen then rebuildFlaggedList() end
+                end
+            end)
+
+            for _, player in ipairs(Players:GetPlayers()) do
+                task.spawn(checkPlayer, player)
+            end
+
+            local c = Players.PlayerAdded:Connect(function(player)
+                if not antiRaidOn then return end
+                task.spawn(checkPlayer, player)
+                player.CharacterAdded:Connect(function()
+                    if antiRaidOn then task.wait(1); checkPlayer(player) end
+                end)
+            end)
+            table.insert(antiRaidConns, c)
+        end)
+    end
+    local function stopAntiRaid()
+        for _, c in ipairs(antiRaidConns) do
+            pcall(function()
+                if c.Disconnect then c:Disconnect()
+                elseif type(c) == "function" then c() end
+            end)
+        end
+        antiRaidConns = {}
+    end
+
+
+    antiRaidToggle.MouseButton1Click:Connect(function()
+        antiRaidOn = not antiRaidOn
+        antiRaidToggle.Text = "Anti-Raid: " .. (antiRaidOn and "ON" or "OFF")
+        TweenService:Create(antiRaidToggle, TweenInfo.new(0.15), { BackgroundColor3 = antiRaidOn and Color3.fromRGB(55,45,75) or Color3.fromRGB(35,35,48) }):Play()
+        TweenService:Create(arStroke, TweenInfo.new(0.15), { Thickness = antiRaidOn and 2 or 1.5 }):Play()
+        if antiRaidOn then
+            flaggedPlayers = {}
+            startAntiRaid()
+        else
+            stopAntiRaid()
+        end
+        if antiRaidListOpen then rebuildFlaggedList() end
+    end)
+
+    antiRaidDropBtn.MouseButton1Click:Connect(function()
+        antiRaidListOpen = not antiRaidListOpen
+        arList.Visible = antiRaidListOpen
+        antiRaidDropBtn.Text = antiRaidListOpen and "▴" or "▾"
+        if antiRaidListOpen then rebuildFlaggedList() end
+    end)
+
+    -- Reactions + Auto Spectators toggles row
+    local toggleRow = Instance.new("Frame")
+    toggleRow.Size = UDim2.new(1,0,0,22); toggleRow.BackgroundTransparency = 1
+    toggleRow.LayoutOrder = 9; toggleRow.Parent = miscFrame
+    local toggleRowLayout = Instance.new("UIListLayout"); toggleRowLayout.FillDirection = Enum.FillDirection.Horizontal
+    toggleRowLayout.Padding = UDim.new(0,5); toggleRowLayout.SortOrder = Enum.SortOrder.LayoutOrder; toggleRowLayout.Parent = toggleRow
+
+    local reactionsOn = true
+    local autoSpecOn  = false
+    local autoSpecThread = nil
+
+    local function makeToggleBtn(label, order, startOn)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.5,-3,1,0); btn.Font = Enum.Font.FredokaOne; btn.TextSize = 10
+        btn.Text = label .. (startOn and ": ON" or ": OFF"); btn.TextColor3 = Color3.fromRGB(255,255,255)
+        btn.BackgroundColor3 = startOn and Color3.fromRGB(55,45,75) or Color3.fromRGB(35,35,48)
+        btn.LayoutOrder = order; btn.Parent = toggleRow
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+        local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Color = Color3.fromRGB(108,75,171)
+        s.Thickness = startOn and 2 or 1; s.Transparency = 0.2; s.Parent = btn
+        return btn, s
+    end
+
+    local reactBtn, reactStroke = makeToggleBtn("Reactions", 1, true)
+    local specBtn,  specStroke  = makeToggleBtn("Auto Spec",  2, false)
+
+    reactBtn.MouseButton1Click:Connect(function()
+        reactionsOn = not reactionsOn
+        reactBtn.Text = "Reactions: " .. (reactionsOn and "ON" or "OFF")
+        TweenService:Create(reactBtn, TweenInfo.new(0.15), { BackgroundColor3 = reactionsOn and Color3.fromRGB(55,45,75) or Color3.fromRGB(35,35,48) }):Play()
+        TweenService:Create(reactStroke, TweenInfo.new(0.15), { Thickness = reactionsOn and 2 or 1 }):Play()
+        if not reactionsOn then stopReactionLoop()
+        elseif mockState.active then startReactionLoop() end
+    end)
+
+    -- Auto spectators: ramps 1→2→3→random up to CONFIG.SPECTATOR_COUNT
+    local function startAutoSpec()
+        if autoSpecThread then task.cancel(autoSpecThread); autoSpecThread = nil end
+        autoSpecThread = task.spawn(function()
+            local steps = {1, 2, 3}
+            local idx = 1
+            while autoSpecOn and mockState.active do
+                local target = CONFIG.SPECTATOR_COUNT
+                if target <= 0 then task.wait(2); continue end
+                local next
+                if idx <= #steps then
+                    next = math.min(steps[idx], target)
+                    idx = idx + 1
+                else
+                    next = math.random(1, target)
+                end
+                if mockState.trade then
+                    mockState.trade.subscriber_count = next
+                    pcall(function() TradeApp:_update_spectator_count(mockState.trade) end)
+                end
+                task.wait(math.random(1, 4))
+            end
+        end)
+    end
+
+    specBtn.MouseButton1Click:Connect(function()
+        autoSpecOn = not autoSpecOn
+        specBtn.Text = "Auto Spec: " .. (autoSpecOn and "ON" or "OFF")
+        TweenService:Create(specBtn, TweenInfo.new(0.15), { BackgroundColor3 = autoSpecOn and Color3.fromRGB(55,45,75) or Color3.fromRGB(35,35,48) }):Play()
+        TweenService:Create(specStroke, TweenInfo.new(0.15), { Thickness = autoSpecOn and 2 or 1 }):Play()
+        if autoSpecOn and mockState.active then
+            startAutoSpec()
+        elseif autoSpecThread then
+            task.cancel(autoSpecThread); autoSpecThread = nil
+        end
+    end)
+
+    -- Hook startReactionLoop to respect toggle
+    local origStartReactionLoop = startReactionLoop
+    startReactionLoop = function()
+        if reactionsOn then origStartReactionLoop() end
+    end
+
+    -- Auto-start autoSpec when trade begins if toggle is on
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if autoSpecOn and mockState.active and not autoSpecThread then
+                startAutoSpec()
+            elseif not mockState.active and autoSpecThread then
+                task.cancel(autoSpecThread); autoSpecThread = nil
+            end
+        end
+    end)
+
+    local suggestBox = Instance.new("TextBox")
+    suggestBox.Size = UDim2.new(1,0,0,22); suggestBox.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    suggestBox.Text = SUGGEST_BTN_TEXT; suggestBox.PlaceholderText = "e.g. Suggest"
+    suggestBox.Font = Enum.Font.SourceSans; suggestBox.TextSize = 11
+    suggestBox.TextColor3 = Color3.fromRGB(255,255,255); suggestBox.PlaceholderColor3 = Color3.fromRGB(100,100,120)
+    suggestBox.ClearTextOnFocus = false; suggestBox.TextXAlignment = Enum.TextXAlignment.Left
+    suggestBox.LayoutOrder = 11; suggestBox.Parent = miscFrame
+    Instance.new("UICorner", suggestBox).CornerRadius = UDim.new(0,4)
+    local sbPad2 = Instance.new("UIPadding"); sbPad2.PaddingLeft = UDim.new(0,6); sbPad2.PaddingRight = UDim.new(0,6); sbPad2.Parent = suggestBox
+    local sbStroke2 = Instance.new("UIStroke"); sbStroke2.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    sbStroke2.Color = Color3.fromRGB(108,75,171); sbStroke2.Thickness = 1; sbStroke2.Transparency = 0.3; sbStroke2.Parent = suggestBox
+
+    local function applySuggestText(text)
+        if text == "" then return end
+        SUGGEST_BTN_TEXT = text
+        -- Update any visible suggest buttons in PlayerGui immediately
+        pcall(function()
+            local pGui = Players.LocalPlayer.PlayerGui
+            -- Trade chat suggest buttons
+            for _, gui in ipairs(pGui:GetChildren()) do
+                for _, desc in ipairs(gui:GetDescendants()) do
+                    if (desc:IsA("TextLabel") or desc:IsA("TextButton")) then
+                        if desc.Text == "Boost" or desc.Text == "Suggest" or desc.Text == SUGGEST_BTN_TEXT then
+                            -- Only change if it's a suggest-style button (not Accept/Decline etc)
+                            local name = desc.Name:lower()
+                            if name:find("suggest") or (desc.Parent and desc.Parent.Name:lower():find("suggest")) then
+                                desc.Text = SUGGEST_BTN_TEXT
+                            end
+                        end
+                    end
+                end
+            end
+            -- Profile app suggest/boost buttons
+            local profileGui = pGui:FindFirstChild("PlayerProfileApp")
+            if profileGui then
+                for _, desc in ipairs(profileGui:GetDescendants()) do
+                    if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and
+                       (desc.Text == "Trade" or desc.Text == "Boost" or desc.Text == "Suggest") then
+                        desc.Text = SUGGEST_BTN_TEXT
+                    end
+                end
+            end
+        end)
+        if HintApp then HintApp:hint({ text = "Suggest button: " .. text, length = 2, overridable = true }) end
+    end
+
+    suggestBox.FocusLost:Connect(function()
+        applySuggestText(suggestBox.Text)
+        TweenService:Create(sbStroke2, TweenInfo.new(0.2), { Transparency = 0.3 }):Play()
+    end)
+    suggestBox.Focused:Connect(function()
+        TweenService:Create(sbStroke2, TweenInfo.new(0.2), { Transparency = 0 }):Play()
+    end)
+
+    -- Poll to keep profile app button text updated while it's open
+    task.spawn(function()
+        while true do
+            task.wait(0.1)
+            if not (mockState and mockState.active) then continue end
+            pcall(function()
+                local profileGui = Players.LocalPlayer.PlayerGui:FindFirstChild("PlayerProfileApp")
+                if not profileGui then return end
+                for _, desc in ipairs(profileGui:GetDescendants()) do
+                    if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and
+                       (desc.Text == "Trade" or desc.Text == "Boost" or desc.Text == "Suggest") then
+                        desc.Text = SUGGEST_BTN_TEXT
+                    end
+                end
+            end)
+        end
+    end)
+
+end
+do -- misc sub: Setup Live
+    -- ── Setup Live section ────────────────────────────────────────────
+    -- One-click setup that fires Spawn All Variants → Fake Inventory →
+    -- Fake Trade History → Fake Profile, then ensures the chat tab is enabled.
+    -- Profile spawning uses the SaveProfileSlot remote (PlayerProfileAPI)
+    -- to fill all 7 pages × 4 widgets with Bat Dragon collections, plus
+    -- ClientData/FetchProfile hooks so the data survives refreshes.
+
+    -- Section label
+    local slLabel = Instance.new("TextLabel")
+    slLabel.Size = UDim2.new(1,0,0,13); slLabel.BackgroundTransparency = 1
+    slLabel.Text = "Setup Live"; slLabel.Font = Enum.Font.SourceSansSemibold
+    slLabel.TextSize = 11; slLabel.TextColor3 = Color3.fromRGB(220,180,120)
+    slLabel.TextXAlignment = Enum.TextXAlignment.Left; slLabel.LayoutOrder = 24
+    slLabel.Parent = miscFrame
+
+    -- ── Fake Profile pet + props state ────────────────────────────────
+    local fpSelectedPetIndex = 1
+    local fpSelectedPetName  = HIGH_TIER_PETS[1] or "Bat Dragon"
+    local fpProps = { mega_neon = true, neon = false, flyable = true, rideable = true }
+
+    _G._fpSetPet = function(index, name)
+        if type(index) == "number" then fpSelectedPetIndex = index end
+        if type(name)  == "string" then fpSelectedPetName  = name end
+    end
+    _G._fpSetProps = function(props)
+        if type(props) ~= "table" then return end
+        for k, v in pairs(props) do fpProps[k] = v and true or false end
+    end
+
+    -- ── Bat-dragon-style profile filler (uses SaveProfileSlot) ────────
+    local PROFILE_MAX_PAGES = 7
+    local PROFILE_WIDGETS_PER_PAGE = 4
+    local PROFILE_MAX_COLLECTION_ITEMS = 20
+    pcall(function()
+        local SC = load("SharedConstants")
+        if SC and SC.player_profiles then
+            PROFILE_MAX_PAGES = SC.player_profiles.max_pages or PROFILE_MAX_PAGES
+            PROFILE_WIDGETS_PER_PAGE = SC.player_profiles.widgets_per_page or PROFILE_WIDGETS_PER_PAGE
+            PROFILE_MAX_COLLECTION_ITEMS = SC.player_profiles.max_collection_items or PROFILE_MAX_COLLECTION_ITEMS
+        end
+    end)
+
+    local profileUniqueCounter = 0
+    local function fpGenerateUniqueId(kind)
+        profileUniqueCounter = profileUniqueCounter + 1
+        return string.format("fp_%s_%d_%d", tostring(kind or "x"), math.floor(tick()*1000), profileUniqueCounter)
+    end
+
+    local function fpFindKindForPet(petName)
+        if not petName then return nil end
+        local target = petName:lower()
+        for id, item in pairs(InventoryDB.pets or {}) do
+            if item.name and item.name:lower() == target then return id end
+        end
+        return nil
+    end
+
+    local function fpBuildProperties()
+        local p = {}
+        if fpProps.mega_neon then p.mega_neon = true end
+        if fpProps.neon and not fpProps.mega_neon then p.neon = true end
+        if fpProps.flyable  then p.flyable  = true end
+        if fpProps.rideable then p.rideable = true end
+        return p
+    end
+
+    local function fpGetRealUniquesForKind(kind)
+        local uniques = {}
+        local ok, inv = pcall(function() return ClientData.get("inventory") end)
+        if ok and inv and inv.pets then
+            for unique, item in pairs(inv.pets) do
+                if item.kind == kind then
+                    table.insert(uniques, { unique = unique, properties = item.properties or {} })
+                end
+            end
+        end
+        return uniques
+    end
+
+    local function fpBuildCollectionSlotData()
+        local kind = fpFindKindForPet(fpSelectedPetName) or fpSelectedPetName
+        local realPets = fpGetRealUniquesForKind(kind)
+        local items = {}
+        for i = 1, PROFILE_MAX_COLLECTION_ITEMS do
+            if i <= #realPets then
+                items[i] = {
+                    kind       = kind,
+                    category   = "pets",
+                    unique     = realPets[i].unique,
+                    properties = fpBuildProperties(),
+                }
+            else
+                items[i] = {
+                    kind       = kind,
+                    category   = "pets",
+                    unique     = fpGenerateUniqueId(kind),
+                    properties = fpBuildProperties(),
+                }
+            end
+        end
+        return {
+            widget_kind = "collection",
+            expanded    = true,
+            widget_data = {
+                title = fpSelectedPetName .. "s",
+                items = items,
+            },
+        }
+    end
+
+    -- Hook ClientData.get_server so my profile always shows widgets locally
+    local fpClientDataHooked = false
+    local function fpHookClientData()
+        if fpClientDataHooked then return end
+        local origGet = ClientData.get_server
+        if not origGet then return end
+        fpClientDataHooked = true
+        ClientData.get_server = function(player, key, ...)
+            local result = origGet(player, key, ...)
+            if key == "player_profile" and player == Players.LocalPlayer and result then
+                result.pages = result.pages or {}
+                for page = 1, PROFILE_MAX_PAGES do
+                    local pageEntry
+                    for _, entry in ipairs(result.pages) do
+                        if entry.page_index == page then pageEntry = entry; break end
+                    end
+                    if not pageEntry then
+                        pageEntry = { page_index = page, widgets = {}, stickers = {} }
+                        table.insert(result.pages, pageEntry)
+                    end
+                    pageEntry.widgets = {}
+                    for slot = 1, PROFILE_WIDGETS_PER_PAGE do
+                        table.insert(pageEntry.widgets, {
+                            slot = slot,
+                            data = fpBuildCollectionSlotData(),
+                        })
+                    end
+                end
+            end
+            return result
+        end
+    end
+
+    -- Hook FetchProfile for when other players view my profile
+    local fpFetchHooked = false
+    local function fpHookFetchProfile()
+        if fpFetchHooked then return end
+        pcall(function()
+            local fetchRemote = RouterClient.get("PlayerProfileAPI/FetchProfile")
+            if not fetchRemote then return end
+            fpFetchHooked = true
+            local origInvoke = fetchRemote.InvokeServer
+            fetchRemote.InvokeServer = function(self, userId, ...)
+                local result = origInvoke(self, userId, ...)
+                if userId == Players.LocalPlayer.UserId and result then
+                    result.pages = result.pages or {}
+                    for page = 1, PROFILE_MAX_PAGES do
+                        local pageEntry
+                        for _, entry in ipairs(result.pages) do
+                            if entry.page_index == page then pageEntry = entry; break end
+                        end
+                        if not pageEntry then
+                            pageEntry = { page_index = page, widgets = {}, stickers = {} }
+                            table.insert(result.pages, pageEntry)
+                        end
+                        pageEntry.widgets = {}
+                        for slot = 1, PROFILE_WIDGETS_PER_PAGE do
+                            table.insert(pageEntry.widgets, {
+                                slot = slot,
+                                data = fpBuildCollectionSlotData(),
+                            })
+                        end
+                    end
+                end
+                return result
+            end
+        end)
+    end
+
+    -- Hook PlayerProfileApp once UIManager has it, so refreshes keep widgets
+    local fpAppHooked = {}
+    local function fpHookProfileApp(app)
+        if not app or fpAppHooked[app] then return end
+        fpAppHooked[app] = true
+        if app.on_load_complete then
+            local orig = app.on_load_complete
+            app.on_load_complete = function(self, ...)
+                pcall(function()
+                    if self.player_profile and self.player_profile.is_my_profile then
+                        local pp = self.player_profile
+                        if pp.profile_data then
+                            pp.profile_data.pages = pp.profile_data.pages or {}
+                            for page = 1, PROFILE_MAX_PAGES do
+                                pp.profile_data.pages[page] = pp.profile_data.pages[page] or {}
+                                for slot = 1, PROFILE_WIDGETS_PER_PAGE do
+                                    pp.profile_data.pages[page][slot] = fpBuildCollectionSlotData()
+                                end
+                            end
+                        end
+                    end
+                end)
+                return orig(self, ...)
+            end
+        end
+        if app.open_page then
+            local orig = app.open_page
+            app.open_page = function(self, pageNumber, ...)
+                pcall(function()
+                    if self.player_profile and self.player_profile.is_my_profile then
+                        local pp = self.player_profile
+                        if pp.profile_data then
+                            pp.profile_data.pages = pp.profile_data.pages or {}
+                            pp.profile_data.pages[pageNumber] = pp.profile_data.pages[pageNumber] or {}
+                            for slot = 1, PROFILE_WIDGETS_PER_PAGE do
+                                pp.profile_data.pages[pageNumber][slot] = fpBuildCollectionSlotData()
+                            end
+                        end
+                    end
+                end)
+                return orig(self, pageNumber, ...)
+            end
+        end
+    end
+
+    task.spawn(function()
+        while task.wait(1) do
+            pcall(function()
+                local app = UIManager.apps and UIManager.apps.PlayerProfileApp
+                if app then fpHookProfileApp(app) end
+            end)
+        end
+    end)
+
+    -- Fire all SaveProfileSlot remotes to persist widgets server-side
+    local function fpFireAllSaves()
+        local saveRemote = RouterClient.get("PlayerProfileAPI/SaveProfileSlot")
+        if not saveRemote then return false end
+        for page = 1, PROFILE_MAX_PAGES do
+            for slot = 1, PROFILE_WIDGETS_PER_PAGE do
+                local slotData = fpBuildCollectionSlotData()
+                pcall(function() saveRemote:FireServer(page, slot, slotData) end)
+                task.wait()
+            end
+        end
+        return true
+    end
+
+    -- ── Pet selector for Fake Profile ─────────────────────────────────
+    local fpPetRow = Instance.new("Frame")
+    fpPetRow.Size = UDim2.new(1,0,0,22); fpPetRow.BackgroundTransparency = 1
+    fpPetRow.LayoutOrder = 25; fpPetRow.Parent = miscFrame
+
+    local fpPetToggle = Instance.new("TextButton")
+    fpPetToggle.Size = UDim2.new(1,0,1,0); fpPetToggle.BackgroundColor3 = Color3.fromRGB(40,40,55)
+    fpPetToggle.Font = Enum.Font.SourceSans; fpPetToggle.TextSize = 11
+    fpPetToggle.TextColor3 = Color3.fromRGB(220,220,235); fpPetToggle.TextXAlignment = Enum.TextXAlignment.Left
+    fpPetToggle.Text = "  Pet: " .. fpSelectedPetName .. "  ▾"
+    fpPetToggle.Parent = fpPetRow
+    Instance.new("UICorner", fpPetToggle).CornerRadius = UDim.new(0,4)
+    local fpPetStroke = Instance.new("UIStroke"); fpPetStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    fpPetStroke.Color = Color3.fromRGB(108,75,171); fpPetStroke.Thickness = 1; fpPetStroke.Transparency = 0.3; fpPetStroke.Parent = fpPetToggle
+
+    local fpPetList = Instance.new("ScrollingFrame")
+    fpPetList.Size = UDim2.new(1,0,0,100); fpPetList.BackgroundColor3 = Color3.fromRGB(25,25,35)
+    fpPetList.BackgroundTransparency = 0.2; fpPetList.BorderSizePixel = 0
+    fpPetList.ScrollBarThickness = 3; fpPetList.CanvasSize = UDim2.new(0,0,0,0)
+    fpPetList.AutomaticCanvasSize = Enum.AutomaticSize.Y; fpPetList.LayoutOrder = 26
+    fpPetList.Visible = false; fpPetList.Parent = miscFrame
+    Instance.new("UICorner", fpPetList).CornerRadius = UDim.new(0,4)
+    local fpListLayout = Instance.new("UIListLayout"); fpListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    fpListLayout.Padding = UDim.new(0,2); fpListLayout.Parent = fpPetList
+    local fpListPad = Instance.new("UIPadding"); fpListPad.PaddingTop = UDim.new(0,3); fpListPad.PaddingBottom = UDim.new(0,3)
+    fpListPad.PaddingLeft = UDim.new(0,4); fpListPad.PaddingRight = UDim.new(0,4); fpListPad.Parent = fpPetList
+
+    for i, petName in ipairs(HIGH_TIER_PETS) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1,-6,0,20); b.BackgroundColor3 = Color3.fromRGB(40,40,55)
+        b.Text = "  " .. petName; b.Font = Enum.Font.SourceSans; b.TextSize = 11
+        b.TextColor3 = Color3.fromRGB(220,220,235); b.TextXAlignment = Enum.TextXAlignment.Left
+        b.LayoutOrder = i; b.Parent = fpPetList
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,3)
+        local capName, capIdx = petName, i
+        b.MouseButton1Click:Connect(function()
+            fpSelectedPetIndex = capIdx
+            fpSelectedPetName  = capName
+            fpPetToggle.Text = "  Pet: " .. capName .. "  ▾"
+            fpPetList.Visible = false
+        end)
+    end
+
+    local fpOpen = false
+    fpPetToggle.MouseButton1Click:Connect(function()
+        fpOpen = not fpOpen
+        fpPetList.Visible = fpOpen
+        fpPetToggle.Text = "  Pet: " .. fpSelectedPetName .. (fpOpen and "  ▴" or "  ▾")
+    end)
+
+    -- ── Property checkboxes for fake profile ──────────────────────────
+    local fpFlagRow = Instance.new("Frame")
+    fpFlagRow.Size = UDim2.new(1,0,0,22); fpFlagRow.BackgroundTransparency = 1
+    fpFlagRow.LayoutOrder = 27; fpFlagRow.Parent = miscFrame
+    local fpFlagLayout = Instance.new("UIListLayout"); fpFlagLayout.FillDirection = Enum.FillDirection.Horizontal
+    fpFlagLayout.SortOrder = Enum.SortOrder.LayoutOrder; fpFlagLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    fpFlagLayout.Padding = UDim.new(0,4); fpFlagLayout.Parent = fpFlagRow
+
+    local fpFlagDefs = {
+        { key = "mega_neon", label = "Mega", on = Color3.fromRGB(130,50,210) },
+        { key = "neon",      label = "Neon", on = Color3.fromRGB(30,180,90) },
+        { key = "flyable",   label = "Fly",  on = Color3.fromRGB(50,100,220) },
+        { key = "rideable",  label = "Ride", on = Color3.fromRGB(200,50,50) },
+    }
+    local fpFlagRefs = {}
+    for i, def in ipairs(fpFlagDefs) do
+        local fb = Instance.new("TextButton")
+        local isOn = fpProps[def.key]
+        fb.Size = UDim2.new(0,40,1,0); fb.BackgroundColor3 = isOn and def.on or Color3.fromRGB(30,30,45)
+        fb.Text = def.label; fb.Font = Enum.Font.GothamBold; fb.TextSize = 10
+        fb.TextColor3 = isOn and Color3.fromRGB(255,255,255) or Color3.fromRGB(120,120,140)
+        fb.LayoutOrder = i; fb.Parent = fpFlagRow
+        Instance.new("UICorner", fb).CornerRadius = UDim.new(0,4)
+        local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Color = isOn and def.on or Color3.fromRGB(60,60,80); s.Thickness = 1; s.Parent = fb
+        fpFlagRefs[def.key] = { btn = fb, stroke = s, def = def }
+        local k = def.key
+        fb.MouseButton1Click:Connect(function()
+            fpProps[k] = not fpProps[k]
+            if k == "mega_neon" and fpProps.mega_neon then fpProps.neon = false end
+            if k == "neon" and fpProps.neon then fpProps.mega_neon = false end
+            for kk, ref in pairs(fpFlagRefs) do
+                local on = fpProps[kk]
+                ref.btn.BackgroundColor3 = on and ref.def.on or Color3.fromRGB(30,30,45)
+                ref.btn.TextColor3 = on and Color3.fromRGB(255,255,255) or Color3.fromRGB(120,120,140)
+                ref.stroke.Color = on and ref.def.on or Color3.fromRGB(60,60,80)
+            end
+        end)
+    end
+
+    -- ── Fake Inventory button ─────────────────────────────────────────
+    local fakeInvBtn = Instance.new("TextButton")
+    fakeInvBtn.Size = UDim2.new(1,0,0,24); fakeInvBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    fakeInvBtn.Text = "Spawn Fake Inventory"; fakeInvBtn.Font = Enum.Font.FredokaOne; fakeInvBtn.TextSize = 11
+    fakeInvBtn.TextColor3 = Color3.fromRGB(255,255,255); fakeInvBtn.LayoutOrder = 28
+    fakeInvBtn.Parent = miscFrame
+    Instance.new("UICorner", fakeInvBtn).CornerRadius = UDim.new(0,4)
+    local fiStroke = Instance.new("UIStroke"); fiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    fiStroke.Color = Color3.fromRGB(60,130,200); fiStroke.Thickness = 1.5; fiStroke.Transparency = 0.3; fiStroke.Parent = fakeInvBtn
+
+    local fakeInvBusy = false
+    local function fpRunFakeInv()
+        if fakeInvBusy then return end
+        fakeInvBusy = true
+        fakeInvBtn.Text = "Spawning Inventory..."
+        task.spawn(function()
+            local createFn = _G._BPCreateInventoryItem
+            if not createFn then
+                fakeInvBtn.Text = "Spawn Fake Inventory"
+                fakeInvBusy = false
+                return
+            end
+            local count = 0
+            local variants = {
+                { F=true,  R=true,  N=false, M=true  },
+                { F=true,  R=true,  N=true,  M=false },
+                { F=true,  R=true,  N=false, M=false },
+                { F=true,  R=false, N=false, M=true  },
+                { F=false, R=true,  N=false, M=true  },
+            }
+            for _, petName in ipairs(HIGH_TIER_PETS) do
+                local kind
+                for id, item in pairs(InventoryDB.pets or {}) do
+                    if item.name and item.name:lower() == petName:lower() then kind = id; break end
+                end
+                if kind then
+                    for _, v in ipairs(variants) do
+                        pcall(function()
+                            createFn(kind, "pets", { flyable=v.F, rideable=v.R, neon=v.N, mega_neon=v.M, age=6, xp=0, rp_name="" })
+                            count = count + 1
+                        end)
+                        task.wait()
+                    end
+                end
+            end
+            fakeInvBtn.Text = "Spawned " .. count
+            task.delay(1.5, function() fakeInvBtn.Text = "Spawn Fake Inventory" end)
+            fakeInvBusy = false
+        end)
+    end
+    fakeInvBtn.MouseButton1Click:Connect(fpRunFakeInv)
+    _G._setupLiveRunFakeInv = fpRunFakeInv
+    _G._setupLiveFakeInvBtn = fakeInvBtn
+
+    -- ── Fake Trade History button ─────────────────────────────────────
+    local fakeHistBtn = Instance.new("TextButton")
+    fakeHistBtn.Size = UDim2.new(1,0,0,24); fakeHistBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    fakeHistBtn.Text = "Spawn Fake Trade History"; fakeHistBtn.Font = Enum.Font.FredokaOne; fakeHistBtn.TextSize = 11
+    fakeHistBtn.TextColor3 = Color3.fromRGB(255,255,255); fakeHistBtn.LayoutOrder = 29
+    fakeHistBtn.Parent = miscFrame
+    Instance.new("UICorner", fakeHistBtn).CornerRadius = UDim.new(0,4)
+    local fhStroke = Instance.new("UIStroke"); fhStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    fhStroke.Color = Color3.fromRGB(200,130,60); fhStroke.Thickness = 1.5; fhStroke.Transparency = 0.3; fhStroke.Parent = fakeHistBtn
+
+    local FAKE_PARTNERS = {
+        "Roblox", "Builderman", "Telamon", "JesseRaen", "NewFissy", "Bethink",
+        "FishCubedRBLX", "BeeismCool", "preston", "Linkmon99", "Tofuu",
+        "DenisDaily", "InquisitorMaster", "iamSanna", "leah_ashe",
+        "uniquesora", "Megan_Plays", "Kreekcraft", "Flamingo",
+    }
+
+    local fakeHistBusy = false
+    local function fpRunFakeHistory()
+        if fakeHistBusy then return end
+        fakeHistBusy = true
+        fakeHistBtn.Text = "Spawning History..."
+        task.spawn(function()
+            local count = 0
+            local addedIds = {}
+            for i = 1, 25 do
+                local partnerName = FAKE_PARTNERS[math.random(1, #FAKE_PARTNERS)]
+                local partnerUid  = math.random(100000, 999999999)
+                local myItems = {}
+                local theirItems = {}
+                for j = 1, math.random(1, 4) do
+                    local petName = HIGH_TIER_PETS[math.random(1, #HIGH_TIER_PETS)]
+                    local kind
+                    for id, item in pairs(InventoryDB.pets or {}) do
+                        if item.name and item.name:lower() == petName:lower() then kind = id; break end
+                    end
+                    if kind then
+                        local v = math.random(1,12)
+                        local props = {
+                            neon      = v>=5 and v<=8,
+                            mega_neon = v>=1 and v<=4,
+                            flyable   = v==1 or v==3 or v==5 or v==6 or v==9 or v==10,
+                            rideable  = v==1 or v==2 or v==5 or v==7 or v==9 or v==11,
+                            age       = math.random(1,6),
+                            xp        = 0, rp_name = "",
+                        }
+                        table.insert(myItems, {
+                            unique = HttpService:GenerateGUID(false),
+                            category = "pets", kind = kind, properties = props,
+                        })
+                    end
+                end
+                for j = 1, math.random(1, 4) do
+                    local petName = HIGH_TIER_PETS[math.random(1, #HIGH_TIER_PETS)]
+                    local kind
+                    for id, item in pairs(InventoryDB.pets or {}) do
+                        if item.name and item.name:lower() == petName:lower() then kind = id; break end
+                    end
+                    if kind then
+                        local v = math.random(1,12)
+                        local props = {
+                            neon      = v>=5 and v<=8,
+                            mega_neon = v>=1 and v<=4,
+                            flyable   = v==1 or v==3 or v==5 or v==6 or v==9 or v==10,
+                            rideable  = v==1 or v==2 or v==5 or v==7 or v==9 or v==11,
+                            age       = math.random(1,6),
+                            xp        = 0, rp_name = "",
+                        }
+                        table.insert(theirItems, {
+                            unique = HttpService:GenerateGUID(false),
+                            category = "pets", kind = kind, properties = props,
+                        })
+                    end
+                end
+                local tradeId = "MOCK_FAKE_" .. tick() .. "_" .. i
+                local record = {
+                    trade_id = tradeId, timestamp = os.time() - math.random(60, 60*60*24*30),
+                    sender_user_id = Players.LocalPlayer.UserId, sender_name = Players.LocalPlayer.Name,
+                    sender_items = myItems,
+                    recipient_user_id = partnerUid, recipient_name = partnerName,
+                    recipient_items = theirItems,
+                    reported = false, reverted = nil,
+                }
+                if not mockState.addedTradeIds[tradeId] then
+                    mockState.addedTradeIds[tradeId] = true
+                    table.insert(mockState.tradeHistory, record)
+                    table.insert(addedIds, tradeId)
+                    count = count + 1
+                end
+                task.wait()
+            end
+            pcall(function()
+                if TradeHistoryApp and TradeHistoryApp.instance and TradeHistoryApp.instance.Frame.Visible then
+                    TradeHistoryApp:_refresh()
+                end
+            end)
+            fakeHistBtn.Text = "Spawned " .. count
+            task.delay(1.5, function() fakeHistBtn.Text = "Spawn Fake Trade History" end)
+            fakeHistBusy = false
+        end)
+    end
+    fakeHistBtn.MouseButton1Click:Connect(fpRunFakeHistory)
+    _G._setupLiveRunFakeHistory = fpRunFakeHistory
+    _G._setupLiveFakeHistoryBtn = fakeHistBtn
+
+    -- ── Fake Profile button ───────────────────────────────────────────
+    local fakeProfBtn = Instance.new("TextButton")
+    fakeProfBtn.Size = UDim2.new(1,0,0,24); fakeProfBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    fakeProfBtn.Text = "Spawn Fake Profile"; fakeProfBtn.Font = Enum.Font.FredokaOne; fakeProfBtn.TextSize = 11
+    fakeProfBtn.TextColor3 = Color3.fromRGB(255,255,255); fakeProfBtn.LayoutOrder = 30
+    fakeProfBtn.Parent = miscFrame
+    Instance.new("UICorner", fakeProfBtn).CornerRadius = UDim.new(0,4)
+    local fpBtnStroke = Instance.new("UIStroke"); fpBtnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    fpBtnStroke.Color = Color3.fromRGB(108,75,171); fpBtnStroke.Thickness = 1.5; fpBtnStroke.Transparency = 0.3; fpBtnStroke.Parent = fakeProfBtn
+
+    local fakeProfBusy = false
+    local function fpRunFakeProfile()
+        if fakeProfBusy then return end
+        fakeProfBusy = true
+        fakeProfBtn.Text = "Spawning Profile..."
+        task.spawn(function()
+            -- Install local hooks so the data survives refreshes
+            pcall(fpHookClientData)
+            pcall(fpHookFetchProfile)
+            pcall(function()
+                local app = UIManager.apps and UIManager.apps.PlayerProfileApp
+                if app then fpHookProfileApp(app) end
+            end)
+            local ok, err = pcall(fpFireAllSaves)
+            if not ok then
+                fakeProfBtn.Text = "Error"
+            else
+                fakeProfBtn.Text = "Spawned!"
+            end
+            task.delay(1.5, function() fakeProfBtn.Text = "Spawn Fake Profile" end)
+            fakeProfBusy = false
+        end)
+    end
+    fakeProfBtn.MouseButton1Click:Connect(fpRunFakeProfile)
+    _G._setupLiveRunFakeProfile = fpRunFakeProfile
+    _G._setupLiveFakeProfileBtn = fakeProfBtn
+
+    -- ── Chat tab toggle ───────────────────────────────────────────────
+    _chatTabEnabled = true
+    _setChatTabVisible = function(visible)
+        pcall(function()
+            local data = tabButtons["Chats"]
+            if data and data.button then data.button.Visible = visible end
+            if not visible and currentTab == "Chats" then setActiveTab("Control") end
+        end)
+    end
+
+    local chatRow = Instance.new("Frame")
+    chatRow.Size = UDim2.new(1,0,0,22); chatRow.BackgroundTransparency = 1
+    chatRow.LayoutOrder = 32; chatRow.Parent = miscFrame
+
+    local chatLbl = Instance.new("TextLabel")
+    chatLbl.Size = UDim2.new(1,-50,1,0); chatLbl.BackgroundTransparency = 1
+    chatLbl.Text = "Chats Tab"; chatLbl.Font = Enum.Font.SourceSansSemibold
+    chatLbl.TextSize = 11; chatLbl.TextColor3 = Color3.fromRGB(200,200,210)
+    chatLbl.TextXAlignment = Enum.TextXAlignment.Left; chatLbl.Parent = chatRow
+
+    local chatToggleBtn = Instance.new("TextButton")
+    chatToggleBtn.Size = UDim2.new(0,46,1,0); chatToggleBtn.Position = UDim2.new(1,-46,0,0)
+    chatToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50); chatToggleBtn.Text = "ON"
+    chatToggleBtn.Font = Enum.Font.GothamBold; chatToggleBtn.TextSize = 10
+    chatToggleBtn.TextColor3 = Color3.fromRGB(80,255,130); chatToggleBtn.Parent = chatRow
+    Instance.new("UICorner", chatToggleBtn).CornerRadius = UDim.new(0,4)
+    local chatToggleStroke = Instance.new("UIStroke"); chatToggleStroke.Color = Color3.fromRGB(0,255,100)
+    chatToggleStroke.Thickness = 1; chatToggleStroke.Parent = chatToggleBtn
+
+    _G._chatToggleBtn    = chatToggleBtn
+    _G._chatToggleStroke = chatToggleStroke
+
+    chatToggleBtn.MouseButton1Click:Connect(function()
+        _chatTabEnabled = not _chatTabEnabled
+        _setChatTabVisible(_chatTabEnabled)
+        if _chatTabEnabled then
+            chatToggleBtn.Text = "ON"
+            chatToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+            chatToggleBtn.TextColor3 = Color3.fromRGB(80,255,130)
+            chatToggleStroke.Color = Color3.fromRGB(0,255,100)
+        else
+            chatToggleBtn.Text = "OFF"
+            chatToggleBtn.BackgroundColor3 = Color3.fromRGB(60,30,30)
+            chatToggleBtn.TextColor3 = Color3.fromRGB(255,120,120)
+            chatToggleStroke.Color = Color3.fromRGB(160,60,60)
+        end
+    end)
+
+    -- ── Setup Live status label ───────────────────────────────────────
+    local setupLiveStatusLbl = Instance.new("TextLabel")
+    setupLiveStatusLbl.Size = UDim2.new(1,0,0,14); setupLiveStatusLbl.BackgroundTransparency = 1
+    setupLiveStatusLbl.Text = ""; setupLiveStatusLbl.Font = Enum.Font.SourceSans
+    setupLiveStatusLbl.TextSize = 10; setupLiveStatusLbl.TextColor3 = Color3.fromRGB(180,180,200)
+    setupLiveStatusLbl.TextXAlignment = Enum.TextXAlignment.Center
+    setupLiveStatusLbl.LayoutOrder = 33; setupLiveStatusLbl.Parent = miscFrame
+
+    -- ── Setup Live button (user-provided handler logic) ───────────────
+    local setupLiveBtn = Instance.new("TextButton")
+    setupLiveBtn.Size = UDim2.new(1,0,0,28); setupLiveBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    setupLiveBtn.Text = "⚡ Setup Live"; setupLiveBtn.Font = Enum.Font.FredokaOne; setupLiveBtn.TextSize = 12
+    setupLiveBtn.TextColor3 = Color3.fromRGB(255,255,255); setupLiveBtn.LayoutOrder = 34
+    setupLiveBtn.Parent = miscFrame
+    Instance.new("UICorner", setupLiveBtn).CornerRadius = UDim.new(0,5)
+    local slStroke = Instance.new("UIStroke"); slStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    slStroke.Color = Color3.fromRGB(108,75,171); slStroke.Thickness = 1.5; slStroke.Transparency = 0.2; slStroke.Parent = setupLiveBtn
+
+    setupLiveBtn.MouseButton1Click:Connect(function()
+        setupLiveBtn.Text = "Setting up..."
+        setupLiveBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+
+        task.spawn(function()
+            local function setStatus(txt)
+                setupLiveStatusLbl.Text = txt
+            end
+
+            setStatus("Setting delays...")
+            CONFIG.AUTO_ACCEPT_DELAY  = 0.5
+            CONFIG.AUTO_CONFIRM_DELAY = 0.5
+            if _G._acceptBox   then _G._acceptBox.Text   = "0.5" end
+            if _G._confirmBox  then _G._confirmBox.Text  = "0.5" end
+
+            CONFIG.SPECTATOR_COUNT = 5
+            if _G._spectatorBox then _G._spectatorBox.Text = "5" end
+
+            task.wait(0.2)
+
+            setStatus("Spawning all variants...")
+            if _G._setupLiveRunSpawnAllVariants then
+                _G._setupLiveRunSpawnAllVariants()
+                local t0 = tick()
+                local allVBtn = _G._setupLiveSpawnAllVariantsBtn
+                if allVBtn then
+                    repeat task.wait(0.5) until allVBtn.Text == "Spawn All Variants" or tick()-t0 > 60
+                end
+            end
+
+            task.wait(0.5)
+
+            setStatus("Spawning fake inventory...")
+            if _G._setupLiveRunFakeInv then
+                _G._setupLiveRunFakeInv()
+                local t0 = tick()
+                local fInvBtn = _G._setupLiveFakeInvBtn
+                if fInvBtn then
+                    repeat task.wait(0.5) until (fInvBtn.Text == "Spawn Fake Inventory" or fInvBtn.Text:find("Spawned")) or tick()-t0 > 30
+                end
+            end
+
+            task.wait(0.5)
+
+            setStatus("Spawning fake trade history...")
+            if _G._setupLiveRunFakeHistory then
+                _G._setupLiveRunFakeHistory()
+                local t0 = tick()
+                local fHistBtn = _G._setupLiveFakeHistoryBtn
+                if fHistBtn then
+                    repeat task.wait(0.5) until fHistBtn.Text == "Spawn Fake Trade History" or tick()-t0 > 60
+                end
+            end
+
+            task.wait(0.5)
+
+            setStatus("Spawning fake profile...")
+            pcall(function()
+                for i, name in ipairs(HIGH_TIER_PETS) do
+                    if name:lower():find("bat") and name:lower():find("dragon") then
+                        if _G._fpSetPet then _G._fpSetPet(i, name) end
+                        break
+                    end
+                end
+                if _G._fpSetProps then
+                    _G._fpSetProps({ mega_neon=true, neon=false, flyable=true, rideable=true })
+                end
+            end)
+            if _G._setupLiveRunFakeProfile then
+                _G._setupLiveRunFakeProfile()
+                local t0 = tick()
+                local fProfBtn = _G._setupLiveFakeProfileBtn
+                if fProfBtn then
+                    repeat task.wait(0.5) until fProfBtn.Text == "Spawn Fake Profile" or tick()-t0 > 60
+                end
+            end
+
+            setStatus("Enabling tabs...")
+            if not _chatTabEnabled then
+                _chatTabEnabled = true
+                _setChatTabVisible(true)
+                pcall(function()
+                    _G._chatToggleBtn.Text = "ON"
+                    _G._chatToggleBtn.BackgroundColor3 = Color3.fromRGB(30,80,50)
+                    _G._chatToggleBtn.TextColor3 = Color3.fromRGB(80,255,130)
+                    _G._chatToggleStroke.Color = Color3.fromRGB(0,255,100)
+                end)
+            end
+            setStatus("✅ Live setup complete!")
+            setupLiveBtn.Text = "⚡ Setup Live"
+            setupLiveBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+            task.delay(3, function() setupLiveStatusLbl.Text = "" end)
+        end)
+    end)
+end
+do -- misc sub
+    -- ── Keybinds (toggleable) ─────────────────────────────────────────
+    local kbToggle = Instance.new("TextButton")
+    kbToggle.Size = UDim2.new(1,0,0,22); kbToggle.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    kbToggle.Text = ""; kbToggle.LayoutOrder = 20; kbToggle.Parent = miscFrame
+    Instance.new("UICorner", kbToggle).CornerRadius = UDim.new(0,4)
+    local kbStroke = Instance.new("UIStroke"); kbStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    kbStroke.Color = Color3.fromRGB(108,75,171); kbStroke.Thickness = 1.5; kbStroke.Transparency = 0.3; kbStroke.Parent = kbToggle
+
+    local kbLbl = Instance.new("TextLabel"); kbLbl.Size = UDim2.new(1,-20,1,0)
+    kbLbl.Position = UDim2.new(0,8,0,0); kbLbl.BackgroundTransparency = 1
+    kbLbl.Text = "Keybinds"; kbLbl.Font = Enum.Font.SourceSansSemibold; kbLbl.TextSize = 11
+    kbLbl.TextColor3 = Color3.fromRGB(220,220,235); kbLbl.TextXAlignment = Enum.TextXAlignment.Left; kbLbl.Parent = kbToggle
+
+    local kbArrow = Instance.new("TextLabel"); kbArrow.Size = UDim2.new(0,14,1,0)
+    kbArrow.Position = UDim2.new(1,-16,0,0); kbArrow.BackgroundTransparency = 1
+    kbArrow.Text = "▾"; kbArrow.Font = Enum.Font.GothamBold; kbArrow.TextSize = 10
+    kbArrow.TextColor3 = Color3.fromRGB(180,180,180); kbArrow.Parent = kbToggle
+
+    local kbList = Instance.new("Frame")
+    kbList.Size = UDim2.new(1,0,0,0); kbList.BackgroundColor3 = Color3.fromRGB(25,25,35)
+    kbList.BackgroundTransparency = 0.3; kbList.BorderSizePixel = 0
+    kbList.Visible = false; kbList.LayoutOrder = 21; kbList.Parent = miscFrame
+    kbList.AutomaticSize = Enum.AutomaticSize.Y
+    Instance.new("UICorner", kbList).CornerRadius = UDim.new(0,5)
+    local kbListLayout = Instance.new("UIListLayout"); kbListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    kbListLayout.Padding = UDim.new(0,2); kbListLayout.Parent = kbList
+    local kbListPad = Instance.new("UIPadding"); kbListPad.PaddingTop = UDim.new(0,5)
+    kbListPad.PaddingBottom = UDim.new(0,5); kbListPad.PaddingLeft = UDim.new(0,6)
+    kbListPad.PaddingRight = UDim.new(0,6); kbListPad.Parent = kbList
+
+    local KEYBINDS = {
+        { label = "Start Trade",          key = Enum.KeyCode.T, action = function() task.spawn(function() updatePartnerFromUsername(CONFIG.PARTNER_NAME); showTradeRequest() end) end },
+        { label = "Partner Accept",       key = Enum.KeyCode.Y, action = doPartnerAccept },
+        { label = "Partner Unaccept",     key = Enum.KeyCode.U, action = doPartnerUnaccept },
+        { label = "Add Random High Tier", key = Enum.KeyCode.P, action = doAddRandomHighTier },
+        { label = "Block Player",         key = Enum.KeyCode.J, action = function()
+            if mockState.active then
+                doBlockPlayer()
+            else
+                -- Real trade — get partner from real trade state
+                pcall(function()
+                    local state = TradeApp:_get_local_trade_state()
+                    if state then
+                        local partner = state.sender == Players.LocalPlayer and state.recipient or state.sender
+                        if partner then
+                            local targetPlayer = Players:FindFirstChild(partner.Name)
+                            if targetPlayer then
+                                CONFIG.PARTNER_NAME = targetPlayer.Name
+                                doBlockPlayer()
+                            end
+                        end
+                    end
+                end)
+            end
+        end },
+        { label = "Decline Trade",        key = Enum.KeyCode.X, action = function() if mockState.active then TradeApp:_decline_trade() end end },
+    }
+
+    local keyMap = {}
+    for _, def in ipairs(KEYBINDS) do keyMap[def.key] = def end
+
+    UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if UserInputService:GetFocusedTextBox() then return end
+        local def = keyMap[input.KeyCode]
+        if def then pcall(def.action) end
+    end)
+
+    for i, def in ipairs(KEYBINDS) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1,0,0,20); row.BackgroundTransparency = 1
+        row.LayoutOrder = i; row.Parent = kbList
+
+        local keyTag = Instance.new("TextLabel")
+        keyTag.Size = UDim2.new(0,20,1,0); keyTag.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        keyTag.Text = def.key.Name; keyTag.Font = Enum.Font.GothamBold
+        keyTag.TextSize = 9; keyTag.TextColor3 = Color3.fromRGB(200,180,255); keyTag.Parent = row
+        Instance.new("UICorner", keyTag).CornerRadius = UDim.new(0,3)
+        Instance.new("UIStroke", keyTag).Color = Color3.fromRGB(108,75,171)
+
+        local actionLbl = Instance.new("TextLabel")
+        actionLbl.Size = UDim2.new(1,-26,1,0); actionLbl.Position = UDim2.new(0,24,0,0)
+        actionLbl.BackgroundTransparency = 1; actionLbl.Text = def.label
+        actionLbl.Font = Enum.Font.SourceSans; actionLbl.TextSize = 11
+        actionLbl.TextColor3 = Color3.fromRGB(210,210,225); actionLbl.TextXAlignment = Enum.TextXAlignment.Left
+        actionLbl.Parent = row
+    end
+
+    local kbOpen = false
+    kbToggle.MouseButton1Click:Connect(function()
+        kbOpen = not kbOpen
+        kbList.Visible = kbOpen
+        kbArrow.Text = kbOpen and "▴" or "▾"
+    end)
+end
+do -- misc sub: GUI Height
+    local BASE_H = 460
+
+    local secLbl = Instance.new("TextLabel")
+    secLbl.Size = UDim2.new(1,0,0,13); secLbl.BackgroundTransparency = 1
+    secLbl.Text = "GUI Height"; secLbl.Font = Enum.Font.SourceSansSemibold; secLbl.TextSize = 11
+    secLbl.TextColor3 = Color3.fromRGB(180,180,180); secLbl.TextXAlignment = Enum.TextXAlignment.Left
+    secLbl.LayoutOrder = 25; secLbl.Parent = miscFrame
+
+    -- Row: minus | input box | plus
+    local hRow = Instance.new("Frame")
+    hRow.Size = UDim2.new(1,0,0,26); hRow.BackgroundTransparency = 1
+    hRow.LayoutOrder = 26; hRow.Parent = miscFrame
+    local hLayout = Instance.new("UIListLayout")
+    hLayout.FillDirection = Enum.FillDirection.Horizontal
+    hLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    hLayout.Padding = UDim.new(0,4); hLayout.Parent = hRow
+
+    local function makeHBtn(txt, order)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0,26,1,0); b.BackgroundColor3 = Color3.fromRGB(35,35,48)
+        b.Text = txt; b.Font = Enum.Font.GothamBold; b.TextSize = 14
+        b.TextColor3 = Color3.fromRGB(255,255,255); b.LayoutOrder = order; b.Parent = hRow
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,4)
+        local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Color = Color3.fromRGB(108,75,171); s.Thickness = 1.5; s.Transparency = 0.3; s.Parent = b
+        return b
+    end
+
+    local minusBtn = makeHBtn("−", 1)
+
+    local hBox = Instance.new("TextBox")
+    hBox.Size = UDim2.new(1,-60,1,0); hBox.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    hBox.Text = tostring(BASE_H); hBox.Font = Enum.Font.GothamBold; hBox.TextSize = 12
+    hBox.TextColor3 = Color3.fromRGB(255,255,255); hBox.ClearTextOnFocus = false
+    hBox.TextXAlignment = Enum.TextXAlignment.Center; hBox.LayoutOrder = 2; hBox.Parent = hRow
+    Instance.new("UICorner", hBox).CornerRadius = UDim.new(0,4)
+    local hStroke = Instance.new("UIStroke"); hStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    hStroke.Color = Color3.fromRGB(108,75,171); hStroke.Thickness = 1; hStroke.Transparency = 0.4; hStroke.Parent = hBox
+
+    local plusBtn = makeHBtn("+", 3)
+
+    -- Apply button below
+    local applyBtn = Instance.new("TextButton")
+    applyBtn.Size = UDim2.new(1,0,0,24); applyBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    applyBtn.Text = "Apply Height"; applyBtn.Font = Enum.Font.FredokaOne; applyBtn.TextSize = 11
+    applyBtn.TextColor3 = Color3.fromRGB(255,255,255); applyBtn.LayoutOrder = 27; applyBtn.Parent = miscFrame
+    Instance.new("UICorner", applyBtn).CornerRadius = UDim.new(0,4)
+    local applyStroke = Instance.new("UIStroke"); applyStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    applyStroke.Color = Color3.fromRGB(108,75,171); applyStroke.Thickness = 1.5; applyStroke.Transparency = 0.3
+    applyStroke.Parent = applyBtn
+
+    local function applyHeight(h)
+        h = math.clamp(math.floor(h), 200, 900)
+        hBox.Text = tostring(h)
+        mainFrame.Size = UDim2.new(0, 200, 0, h)
+        mainFrame.Position = UDim2.new(0, 13, 0.5, -math.floor(h/2))
+        blackFrame.Size = UDim2.new(0, 206, 0, h + 6)
+        blackFrame.Position = UDim2.new(0, 10, 0.5, -math.floor(h/2) - 3)
+    end
+    -- Auto-apply 700 on execute
+    applyHeight(700)
+
+    minusBtn.MouseButton1Click:Connect(function()
+        local cur = tonumber(hBox.Text) or BASE_H
+        applyHeight(cur - 20)
+    end)
+    plusBtn.MouseButton1Click:Connect(function()
+        local cur = tonumber(hBox.Text) or BASE_H
+        applyHeight(cur + 20)
+    end)
+    applyBtn.MouseButton1Click:Connect(function()
+        local cur = tonumber(hBox.Text) or BASE_H
+        applyHeight(cur)
+    end)
+    hBox.FocusLost:Connect(function()
+        local cur = tonumber(hBox.Text) or BASE_H
+        applyHeight(cur)
+    end)
+end
+
+-- =====================================================================
+-- CHATS TAB
+-- =====================================================================
+do
+local CHAT_MESSAGES = {
+    "Can I boost this??",
+    "GIRL I DONT WANT THAT",
+    "Can I spin this??",
+    "broke and unknown",
+    "last word nig",
+    "BITCHHHH",
+    "Low Tiers please!",
+    "U RICH OMGG",
+    "Egals are so cute",
+    "Pick any of my pets!",
+    "RUBBER DILDO 🍆💦",
+    "Inside of my inventory is a bat dragon, can I spin it?",
+    "Now can I please have my dream pet",
+    "Tell me what I can get from boosting this please!!!!",
+    "OH PUT IT DOWN",
+    "A ROSETOY JUST FELL OUT MY ASS",
+    "DILDO",
+    "Octopus is my dppp",
+    "RICH OMGGGG",
+    "Escort your fatass out of face",
+    "Im followed!",
+    ":)",
+    "can we be besties",
+    "friend zoned",
+}
+
+local chatsFrame = tabFrames["Chats"]
+
+local chatListFrame = Instance.new("ScrollingFrame")
+chatListFrame.Size             = UDim2.new(1, 0, 1, 0)
+chatListFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+chatListFrame.BackgroundTransparency = 0.5
+chatListFrame.BorderSizePixel  = 0
+chatListFrame.ScrollBarThickness = 3
+chatListFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+chatListFrame.ScrollBarImageTransparency = 0.5
+chatListFrame.CanvasSize       = UDim2.new(0, 0, 0, 0)
+chatListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+chatListFrame.Parent           = chatsFrame
+Instance.new("UICorner", chatListFrame).CornerRadius = UDim.new(0, 6)
+
+local chatListLayout = Instance.new("UIListLayout")
+chatListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+chatListLayout.Padding   = UDim.new(0, 4)
+chatListLayout.Parent    = chatListFrame
+
+local chatListPadding = Instance.new("UIPadding")
+chatListPadding.PaddingTop    = UDim.new(0, 6)
+chatListPadding.PaddingBottom = UDim.new(0, 6)
+chatListPadding.PaddingLeft   = UDim.new(0, 6)
+chatListPadding.PaddingRight  = UDim.new(0, 6)
+chatListPadding.Parent        = chatListFrame
+
+for i, msg in ipairs(CHAT_MESSAGES) do
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, -4, 0, 0)
+    btn.AutomaticSize    = Enum.AutomaticSize.Y
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    btn.BackgroundTransparency = 0.2
+    btn.Text             = msg
+    btn.Font             = Enum.Font.SourceSans
+    btn.TextSize         = 11
+    btn.TextColor3       = Color3.fromRGB(220, 220, 235)
+    btn.TextXAlignment   = Enum.TextXAlignment.Left
+    btn.TextWrapped      = true
+    btn.LayoutOrder      = i
+    btn.Parent           = chatListFrame
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+
+    local btnPad = Instance.new("UIPadding")
+    btnPad.PaddingLeft   = UDim.new(0, 7)
+    btnPad.PaddingRight  = UDim.new(0, 7)
+    btnPad.PaddingTop    = UDim.new(0, 5)
+    btnPad.PaddingBottom = UDim.new(0, 5)
+    btnPad.Parent        = btn
+
+    local btnStroke = Instance.new("UIStroke")
+    btnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    btnStroke.Color       = Color3.fromRGB(108, 75, 171)
+    btnStroke.Thickness   = 1.0
+    btnStroke.Transparency = 0.3
+    btnStroke.Parent      = btn
+
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btnStroke, TweenInfo.new(0.12), { Transparency = 0 }):Play()
+        TweenService:Create(btn, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(55, 50, 75) }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btnStroke, TweenInfo.new(0.12), { Transparency = 0.3 }):Play()
+        TweenService:Create(btn, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(40, 40, 50) }):Play()
+    end)
+
+    local capturedMsg = msg
+    btn.MouseButton1Click:Connect(function()
+        if not mockState.active or not mockState.trade then
+            if HintApp then HintApp:hint({ text = "Start a trade first.", length = 2, overridable = true }) end
+            return
+        end
+        pcall(function()
+            if TradeApp._render_message_in_trade_chat then
+                TradeApp:_render_message_in_trade_chat(nil, CONFIG.PARTNER_NAME .. ": " .. capturedMsg, true)
+            end
+        end)
+        -- Flash green to confirm sent
+        TweenService:Create(btnStroke, TweenInfo.new(0.15), { Color = Color3.fromRGB(0, 220, 100), Transparency = 0 }):Play()
+        task.delay(0.5, function()
+            TweenService:Create(btnStroke, TweenInfo.new(0.2), { Color = Color3.fromRGB(108, 75, 171), Transparency = 0.3 }):Play()
+        end)
+    end)
+end
+end -- Chats tab
+
+-- =====================================================================
+-- PETS TAB
+local spawnInvBtn, addTradeBtn, spawnAllBtn, spawnRandBtn
+local petNameBox, petFlags, selectedAge, findPetKind, BPCreateInventoryItem
+local flagDefs, flagButtonRefs, ageButtonRefs, buildAgeRow
+local flagsRow, ageRow, petActionRow, makePetActionBtn
+local petsFrame
+do
+-- =====================================================================
+
+petsFrame = tabFrames["Pets"]
+
+local petsLayout = Instance.new("UIListLayout")
+petsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+petsLayout.Padding   = UDim.new(0, 7)
+petsLayout.Parent    = petsFrame
+
+local petsPadding = Instance.new("UIPadding")
+petsPadding.PaddingLeft  = UDim.new(0, 0)
+petsPadding.PaddingRight = UDim.new(0, 0)
+petsPadding.PaddingTop   = UDim.new(0, 8)
+petsPadding.Parent       = petsFrame
+
+-- =====================================================================
+-- PET SPAWNER — blueprint.lua logic with MockTrade.lua neon fallback
+-- Only load modules that MockTrade.lua also uses to avoid NeonVFXHelper crash
+-- =====================================================================
+
+local AilmentsClient    = nil; pcall(function() AilmentsClient   = load("new:AilmentsClient") end)
+local AilmentsDB        = nil; pcall(function() AilmentsDB        = load("new:AilmentsDB") end)
+local BPPetRigs         = nil; pcall(function() BPPetRigs         = load("new:PetRigs") end)
+local EquipPermissions  = nil; pcall(function() EquipPermissions  = load("EquipPermissions") end)
+local ClientToolManager = nil; pcall(function() ClientToolManager = load("ClientToolManager") end)
+local InteriorsM        = nil; pcall(function() InteriorsM        = load("InteriorsM") end)
+-- CharacterScale internally loads NeonVFXHelper which fails — skip it
+-- CharacterScale.scale_pet is cosmetic only, not needed for equip/ride/fly
+
+-- (SpawnedPets and SpawnedItems declared at top of file)
+local PetModelCache = {}
+local EquippedPet = nil
+local CurrentRideId = nil
+local RideAnimationTrack = nil
+local PetAilmentsCache = {}
+local MegaNeonConnections = {}
+
+local NewnessGroups = {
+    mega_neon_flyable_rideable = 990000, mega_neon_flyable = 980000,
+    mega_neon_rideable = 970000, mega_neon = 960000,
+    neon_flyable_rideable = 950000, neon_flyable = 940000,
+    neon_rideable = 930000, neon = 920000,
+    flyable_rideable = 910000, flyable = 900000,
+    rideable = 890000, regular = 880000,
+}
+
+
+local function GetPropertyGroup(p)
+    local m,n,f,r = p.mega_neon or false, p.neon or false, p.flyable or false, p.rideable or false
+    if m then
+        if f and r then return "mega_neon_flyable_rideable" elseif f then return "mega_neon_flyable"
+        elseif r then return "mega_neon_rideable" else return "mega_neon" end
+    elseif n then
+        if f and r then return "neon_flyable_rideable" elseif f then return "neon_flyable"
+        elseif r then return "neon_rideable" else return "neon" end
+    else
+        if f and r then return "flyable_rideable" elseif f then return "flyable"
+        elseif r then return "rideable" else return "regular" end
+    end
+end
+
+-- Neon using PetRigs directly (MockTrade.lua applyNeonEffects / applyMegaNeonEffects)
+local function BPApplyNeon(petModel, kind)
+    pcall(function()
+        local petModelInstance = petModel:FindFirstChild("PetModel") or petModel
+        local petData = InventoryDB.pets and InventoryDB.pets[kind]
+        if not petData or not petData.neon_parts then return end
+        for neonPart, cfg in pairs(petData.neon_parts) do
+            local part = BPPetRigs.get(petModelInstance).get_geo_part(petModelInstance, neonPart)
+            if part then
+                part.Material = Enum.Material.Neon
+                if cfg.Color then part.Color = cfg.Color end
+            end
+        end
+    end)
+end
+
+local function BPApplyMegaNeon(petModel, kind)
+    pcall(function()
+        local petModelInstance = petModel:FindFirstChild("PetModel") or petModel
+        local petData = InventoryDB.pets and InventoryDB.pets[kind]
+        if not petData or not petData.neon_parts then return end
+        for neonPart, cfg in pairs(petData.neon_parts) do
+            local part = BPPetRigs.get(petModelInstance).get_geo_part(petModelInstance, neonPart)
+            if part then
+                part.Material = Enum.Material.Neon
+                if cfg.Color then
+                    local h, s, v = cfg.Color:ToHSV()
+                    part.Color = Color3.fromHSV(h, math.min(s * 1.3, 1), math.min(v * 1.4, 1))
+                else
+                    part.Color = Color3.fromRGB(170, 0, 255)
+                end
+            end
+        end
+    end)
+end
+
+local function BPStopMegaNeon(uid)
+    local c = MegaNeonConnections[uid]
+    if c then pcall(function() c:Disconnect() end); MegaNeonConnections[uid] = nil end
+end
+
+local function BPApplyNeonVisuals(petModel, petData)
+    local kindKey = petData.kind or petData.id
+    if petData.properties.mega_neon then
+        BPApplyMegaNeon(petModel, kindKey)
+        -- Cycle mega neon colours on heartbeat
+        BPStopMegaNeon(petData.unique)
+        local hue = 0
+        local mi = petModel:FindFirstChild("PetModel") or petModel
+        local conn
+        conn = RunService.Heartbeat:Connect(function(dt)
+            if not petModel.Parent then
+                conn:Disconnect(); MegaNeonConnections[petData.unique] = nil; return
+            end
+            hue = (hue + dt * 0.3) % 1
+            local petDb = InventoryDB.pets and InventoryDB.pets[kindKey]
+            if petDb and petDb.neon_parts then
+                for neonPart in pairs(petDb.neon_parts) do
+                    pcall(function()
+                        local part = BPPetRigs.get(mi).get_geo_part(mi, neonPart)
+                        if part then part.Color = Color3.fromHSV(hue, 1, 1) end
+                    end)
+                end
+            end
+        end)
+        MegaNeonConnections[petData.unique] = conn
+    elseif petData.properties.neon then
+        BPApplyNeon(petModel, kindKey)
+    end
+end
+
+local function BPUpdateData(key, action)
+    pcall(function() setthreadidentity(2) end)
+    local cur = ClientData.get(key)
+    local cloned = table.clone(cur or {})
+    local result = action(cloned)
+    ClientData.predict(key, result)
+    pcall(function() setthreadidentity(8) end)
+    return result
+end
+
+local function BPFindIndex(array, checker)
+    for i, v in pairs(array) do
+        if checker(v, i) then return i end
+    end
+end
+
+local function BPFetchPetModel(kind)
+    if PetModelCache[kind] then return PetModelCache[kind] end
+    local model = load("DownloadClient").promise_download_copy("Pets", kind):expect()
+    PetModelCache[kind] = model
+    return model
+end
+
+local function BPStopMegaNeon(uid)
+    local c = MegaNeonConnections[uid]
+    if c then pcall(function() c:Disconnect() end); MegaNeonConnections[uid] = nil end
+end
+
+local function BPRegisterWrapper(w)
+    BPUpdateData("pet_char_wrappers", function(ws)
+        w.unique = #ws + 1; w.index = #ws + 1
+        ws[#ws + 1] = w; return ws
+    end)
+end
+
+local function BPRegisterState(s)
+    BPUpdateData("pet_state_managers", function(ms)
+        ms[#ms + 1] = s; return ms
+    end)
+end
+
+local function BPRemoveWrapper(uid)
+    BPUpdateData("pet_char_wrappers", function(ws)
+        local i = BPFindIndex(ws, function(w) return w.pet_unique == uid end)
+        if i then table.remove(ws, i)
+            for j = i, #ws do ws[j].unique = j; ws[j].index = j end
+        end
+        return ws
+    end)
+end
+
+local function BPRemoveState(uid)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    BPUpdateData("pet_state_managers", function(ms)
+        local i = BPFindIndex(ms, function(m) return m.char == pet.model end)
+        if i then table.remove(ms, i) end; return ms
+    end)
+end
+
+local function BPClearPetStates(uid)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    BPUpdateData("pet_state_managers", function(ms)
+        local i = BPFindIndex(ms, function(m) return m.char == pet.model end)
+        if i then local u = table.clone(ms); u[i] = table.clone(u[i]); u[i].states = {}; return u end
+        return ms
+    end)
+end
+
+local function BPSetPetState(uid, id)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    BPUpdateData("pet_state_managers", function(ms)
+        local i = BPFindIndex(ms, function(m) return m.char == pet.model end)
+        if i then local u = table.clone(ms); u[i] = table.clone(u[i]); u[i].states = {{id=id}}; return u end
+        return ms
+    end)
+end
+
+local function BPClearPlayerStates()
+    BPUpdateData("state_manager", function(s)
+        local u = table.clone(s); u.states = {}; u.is_sitting = false; return u
+    end)
+end
+
+local function BPSetPlayerState(id)
+    BPUpdateData("state_manager", function(s)
+        local u = table.clone(s); u.states = {{id=id}}; u.is_sitting = true; return u
+    end)
+end
+
+local function BPAttachRideConstraint(petModel)
+    local char = Players.LocalPlayer.Character
+    if not char or not char.PrimaryPart then return false end
+    local ridePos = petModel:FindFirstChild("RidePosition", true)
+    if not ridePos then return false end
+    local att = Instance.new("Attachment")
+    att.Parent = ridePos; att.Position = Vector3.new(0, 1.237, 0); att.Name = "SourceAttachment"
+    local rc = Instance.new("RigidConstraint")
+    rc.Name = "StateConnection"; rc.Attachment0 = att
+    rc.Attachment1 = char.PrimaryPart.RootAttachment; rc.Parent = char
+    return true
+end
+
+local function BPDismount()
+    if not CurrentRideId then return end
+    local pet = SpawnedPets[CurrentRideId]
+    if pet and pet.model then
+        if RideAnimationTrack then RideAnimationTrack:Stop(); RideAnimationTrack:Destroy(); RideAnimationTrack = nil end
+        local att = pet.model:FindFirstChild("SourceAttachment", true)
+        if att then att:Destroy() end
+        local char = Players.LocalPlayer.Character
+        if char then
+            for _, p in pairs(char:GetDescendants()) do
+                if p:IsA("BasePart") and p:GetAttribute("HaveMass") then p.Massless = false end
+            end
+        end
+        BPClearPetStates(CurrentRideId); BPClearPlayerStates()
+        pet.model:ScaleTo(1)
+    end
+    CurrentRideId = nil
+end
+
+local function BPMount(uid, playerState, petState)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    local char = Players.LocalPlayer.Character
+    if not char or not char.PrimaryPart or not char:FindFirstChild("Humanoid") then return end
+    BPDismount(); CurrentRideId = uid
+    BPSetPetState(uid, petState); BPSetPlayerState(playerState)
+    pet.model:ScaleTo(2); BPAttachRideConstraint(pet.model)
+    local ok2, AM = pcall(load, "AnimationManager")
+    if ok2 and AM then
+        RideAnimationTrack = char.Humanoid.Animator:LoadAnimation(AM.get_track("PlayerRidingPet"))
+        char.Humanoid.Sit = true
+        for _, p in pairs(char:GetDescendants()) do
+            if p:IsA("BasePart") and not p.Massless then p.Massless = true; p:SetAttribute("HaveMass", true) end
+        end
+        RideAnimationTrack:Play()
+    end
+end
+
+local function BPUnequip(petData)
+    local pet = SpawnedPets[petData.unique]
+    if not pet or not pet.model then return end
+    if CurrentRideId == petData.unique then BPDismount() end
+    BPStopMegaNeon(petData.unique)
+    BPRemoveWrapper(petData.unique); BPRemoveState(petData.unique)
+    pet.model:Destroy(); pet.model = nil
+    if EquippedPet and EquippedPet.unique == petData.unique then EquippedPet = nil end
+    PetAilmentsCache[petData.unique] = nil
+    task.wait(0.15); if AilmentsClient then pcall(AilmentsClient.on_ailments_changed, Players.LocalPlayer) end
+end
+
+local function BPEquip(petData, options)
+    if petData.category ~= "pets" then return end
+    if EquippedPet then BPUnequip(EquippedPet) end
+    -- Unequip any existing server-side pets
+    for _, w in pairs(ClientData.get("pet_char_wrappers") or {}) do
+        if w.controller == Players.LocalPlayer then
+            pcall(function() load("RouterClient").get("ToolAPI/Unequip"):InvokeServer(w.pet_unique) end)
+        end
+    end
+    if not SpawnedPets[petData.unique] then
+        SpawnedPets[petData.unique] = { data = petData, model = nil }
+    else
+        SpawnedPets[petData.unique].data = petData
+    end
+    local petModel = BPFetchPetModel(petData.kind):Clone()
+    local spawnCFrame = options and options.spawn_cframe
+    if spawnCFrame then
+        pcall(function() petModel:PivotTo(spawnCFrame) end)
+        petModel:SetAttribute("HasSpawnCFrame", true)
+    end
+    petModel.Parent = workspace
+    SpawnedPets[petData.unique].model = petModel
+    BPApplyNeonVisuals(petModel, petData)
+    EquippedPet = petData
+    local loc = nil
+    if InteriorsM then pcall(function() loc = InteriorsM.get_current_location() end) end
+    local destId = (loc and loc.destination_id) or "housing"
+    local fullDestId = (loc and loc.full_destination_id) or destId
+    local subDestId = loc and loc.sub_destination_id
+    task.defer(function()
+        BPRegisterWrapper({
+            char = petModel, mega_neon = petData.properties.mega_neon or false,
+            neon = petData.properties.neon or false,
+            player = Players.LocalPlayer, entity_controller = Players.LocalPlayer,
+            controller = Players.LocalPlayer, rp_name = petData.properties.rp_name or "",
+            pet_trick_level = petData.properties.pet_trick_level or 0,
+            pet_unique = petData.unique, pet_id = petData.id,
+            location = { full_destination_id = fullDestId, destination_id = destId,
+                sub_destination_id = subDestId, house_owner = Players.LocalPlayer },
+            pet_progression = {
+                age = petData.properties.age or math.random(1, 6),
+                xp = petData.properties.xp or 0,
+                friendship_level = petData.properties.friendship_level or 1,
+                friendship_xp = petData.properties.friendship_xp or 0,
+                percentage = math.random(0, 99) / 100,
+            },
+            are_colors_sealed = false, is_pet = true,
+        })
+        BPRegisterState({
+            char = petModel, player = Players.LocalPlayer,
+            store_key = "pet_state_managers",
+            is_sitting = false, chars_connected_to_me = {}, states = {},
+        })
+        task.wait(0.1)
+        pcall(function()
+            BPUpdateData("pet_char_wrappers", function(ws)
+                for _, w in pairs(ws) do
+                    if w.pet_unique == petData.unique then w.rp_name = petData.properties.rp_name or "" end
+                end
+                return ws
+            end)
+        end)
+        task.wait(0.15); if AilmentsClient then pcall(AilmentsClient.on_ailments_changed, Players.LocalPlayer) end
+    end)
+end
+
+-- Sync wrapper locations when player moves between interiors
+task.spawn(function()
+    local lastLoc
+    while task.wait(0.5) do
+        local cur; if InteriorsM then pcall(function() cur = InteriorsM.get_current_location() end) end
+        local id = cur and cur.full_destination_id
+        if id ~= lastLoc then
+            lastLoc = id
+            BPUpdateData("pet_char_wrappers", function(ws)
+                if not cur then return ws end
+                for i, w in ipairs(ws) do
+                    if w.controller == Players.LocalPlayer and w.is_pet then
+                        ws[i] = table.clone(w)
+                        ws[i].location = {
+                            full_destination_id = cur.full_destination_id or cur.destination_id,
+                            destination_id = cur.destination_id,
+                            sub_destination_id = cur.sub_destination_id,
+                            house_owner = w.location and w.location.house_owner or Players.LocalPlayer,
+                        }
+                    end
+                end
+                return ws
+            end)
+            if AilmentsClient then pcall(AilmentsClient.on_ailments_changed, Players.LocalPlayer) end
+        end
+    end
+end)
+
+-- ailments_manager hook so spawned pets show needs indicators
+local origGetServer = ClientData.get_server
+ClientData.get_server = function(player, key, ...)
+    local data = origGetServer(player, key, ...)
+    if key == "ailments_manager" and player == Players.LocalPlayer and AilmentsDB then
+        local loc; if InteriorsM then pcall(function() loc = InteriorsM.get_current_location() end) end
+        if loc and (loc.destination_id == "Cave" or loc.full_destination_id == "Cave") then return data end
+        local ad = {}
+        if data then for k, v in pairs(data) do ad[k] = type(v) == "table" and table.clone(v) or v end end
+        ad.ailments = ad.ailments or {}
+        for uid, info in pairs(SpawnedPets) do
+            if info and info.model then
+                if PetAilmentsCache[uid] then
+                    ad.ailments[uid] = PetAilmentsCache[uid]
+                else
+                    local types = {}
+                    for kind in pairs(AilmentsDB) do
+                        if kind ~= "at_work" and kind ~= "mystery" and kind ~= "walking" then
+                            table.insert(types, kind)
+                        end
+                    end
+                    local petAilments = {}
+                    local used = {}
+                    for i = 1, math.min(math.random(2,4), #types) do
+                        local ak
+                        repeat ak = types[math.random(1, #types)] until not used[ak]
+                        used[ak] = true
+                        petAilments[HttpService:GenerateGUID(false)] = {
+                            components = {}, created_timestamp = os.time(), kind = ak,
+                            progress = 0, rate = 0, rate_timestamp = os.time(), sort_order = i * 100,
+                        }
+                    end
+                    PetAilmentsCache[uid] = petAilments
+                    ad.ailments[uid] = petAilments
+                end
+            end
+        end
+        return ad
+    end
+    return data
+end
+
+-- EquipPermissions: allow equipping our spawned pets
+if EquipPermissions then
+    local origCanEquip = EquipPermissions.can_equip_client
+    EquipPermissions.can_equip_client = function(item)
+        if item and item.unique and SpawnedPets[item.unique] then return true end
+        return origCanEquip(item)
+    end
+end
+
+-- ClientToolManager: fill in missing fields for spawned pets
+if ClientToolManager then
+    local origCTMEquip = ClientToolManager.equip
+    ClientToolManager.equip = function(item, options)
+        if item and item.unique and SpawnedPets[item.unique] and SpawnedPets[item.unique].data then
+            local full = SpawnedPets[item.unique].data
+            for k, v in pairs(full) do if item[k] == nil then item[k] = v end end
+        end
+        return origCTMEquip(item, options)
+    end
+end
+
+local NextNewnessOrder = 60000
+
+-- Main item creator — must be defined before ClientSideDoNeonFusion uses it
+BPCreateInventoryItem = function(itemId, category, properties)
+    local uniqueId = HttpService:GenerateGUID(false)
+    local kd = load("KindDB")[itemId]
+    if not kd then return nil end
+    properties = properties or {}
+    local newnessValue
+    if category == "pets" then
+        local gk = GetPropertyGroup(properties)
+        NewnessGroups[gk] = NewnessGroups[gk] - 1
+        newnessValue = NewnessGroups[gk]
+        if properties.rp_name == nil then properties.rp_name = "" end
+        if properties.xp == nil then properties.xp = 0 end
+    else
+        NextNewnessOrder = NextNewnessOrder - 1
+        newnessValue = NextNewnessOrder
+    end
+    local itemData = {
+        unique = uniqueId, category = category,
+        id = itemId, kind = kd.kind or itemId,
+        newness_order = newnessValue, properties = properties,
+        _source = "mock_trade_gui",
+    }
+    pcall(function() setthreadidentity(2) end)
+    local inv = ClientData.get("inventory")
+    if inv and inv[category] then inv[category][uniqueId] = itemData end
+    pcall(function() setthreadidentity(8) end)
+    if category == "pets" then SpawnedPets[uniqueId] = { data = itemData, model = nil } end
+    SpawnedItems[uniqueId] = true
+    task.defer(function()
+        pcall(function() UIManager.apps.BackpackApp:refresh_rendered_items() end)
+    end)
+    return itemData
+end
+-- Expose for Setup Live (Misc tab) — Fake Inventory uses this from outside the pets scope
+_G._BPCreateInventoryItem = BPCreateInventoryItem
+
+-- Cave Neon Fusion client-side
+local function ClientSideDoNeonFusion(placedUniques)
+    pcall(setthreadidentity, 2)
+    local inv = ClientData.get("inventory")
+    pcall(setthreadidentity, 8)
+
+    if not (inv and inv.pets) then
+        if HintApp then HintApp:hint({text="Fusion: inventory unreadable", length=4, overridable=true}) end
+        return nil, nil
+    end
+
+    local placed = {}
+    for _, uid in ipairs(placedUniques) do
+        local item = inv.pets[uid]
+        if item then table.insert(placed, item) end
+    end
+
+    if #placed < 4 then
+        if HintApp then HintApp:hint({text="Fusion: only " .. #placed .. "/4 pets found", length=4, overridable=true}) end
+        return nil, nil
+    end
+
+    local first = placed[1]
+    local kind = first.kind
+    local srcNeon = first.properties.neon or false
+
+    for i = 2, #placed do
+        if placed[i].kind ~= kind then
+            if HintApp then HintApp:hint({text="Fusion: pet "..i.." wrong kind", length=4, overridable=true}) end
+            return nil, nil
+        end
+        if (placed[i].properties.neon or false) ~= srcNeon then
+            if HintApp then HintApp:hint({text="Fusion: pet "..i.." wrong neon tier", length=4, overridable=true}) end
+            return nil, nil
+        end
+        if placed[i].properties.mega_neon then
+            if HintApp then HintApp:hint({text="Fusion: pet "..i.." already mega neon", length=4, overridable=true}) end
+            return nil, nil
+        end
+        -- Age check intentionally removed — real pets may store age differently
+    end
+
+    local kd = nil
+    pcall(function() kd = load("KindDB")[kind] end)
+
+    local newProps = {
+        age = 6, xp = 0,
+        pet_trick_level = first.properties.pet_trick_level or 0,
+        trick_level = first.properties.trick_level or 0,
+        rp_name = "",
+    }
+
+    if srcNeon then
+        newProps.mega_neon = true; newProps.neon = false
+    else
+        newProps.neon = true; newProps.mega_neon = false
+    end
+
+    for _, p in ipairs(placed) do
+        if p.properties.flyable  then newProps.flyable  = true end
+        if p.properties.rideable then newProps.rideable = true end
+    end
+    if kd then
+        if kd.flyable  then newProps.flyable  = true end
+        if kd.rideable then newProps.rideable = true end
+    end
+
+    pcall(setthreadidentity, 2)
+    local inv2 = ClientData.get("inventory")
+    if inv2 and inv2.pets then
+        for _, uid in ipairs(placedUniques) do inv2.pets[uid] = nil end
+    end
+    local em = ClientData.get("equip_manager")
+    if em and em.pets then
+        local cl = table.clone(em); local kept = {}
+        for _, e in ipairs(cl.pets) do
+            local rm = false
+            for _, uid in ipairs(placedUniques) do if e.unique == uid then rm = true; break end end
+            if not rm then table.insert(kept, e) end
+        end
+        cl.pets = kept; ClientData.predict("equip_manager", cl)
+    end
+    pcall(setthreadidentity, 8)
+
+    for _, uid in ipairs(placedUniques) do
+        BPStopMegaNeon(uid)
+        local pet = SpawnedPets[uid]
+        if pet then
+            if pet.model then pcall(function() pet.model:Destroy() end) end
+            SpawnedPets[uid] = nil
+        end
+        SpawnedItems[uid] = nil
+        PetAilmentsCache[uid] = nil
+    end
+
+    local newItem = BPCreateInventoryItem(kind, "pets", newProps)
+    if not newItem then
+        if HintApp then HintApp:hint({text="Fusion: BPCreateInventoryItem failed, kind=" .. tostring(kind), length=5, overridable=true}) end
+        return nil, nil
+    end
+
+    -- NeonVFXHelper now loads for real (identity-2 trick) so it drives the full
+    -- animation. The recently_fused predict is no longer needed and would fire at
+    -- the wrong time, causing a duplicate/early animation trigger.
+
+    -- Equip only after NeonVFXHelper's full animation completes.
+    -- InvokeServer now returns immediately so the animation starts right away.
+    -- Full sequence: pets glow + float up + merge + result enters bubble + floats down ≈ 24s.
+    task.delay(26, function()
+        local petEntry = SpawnedPets[newItem.unique]
+        if petEntry and petEntry.data then
+            BPEquip(petEntry.data, {
+                spawn_cframe = Players.LocalPlayer.Character
+                    and Players.LocalPlayer.Character.PrimaryPart
+                    and (Players.LocalPlayer.Character.PrimaryPart.CFrame * CFrame.new(0, 12, 0))
+                    or CFrame.new(0, 100, 0)
+            })
+        end
+        pcall(function() UIManager.apps.BackpackApp:refresh_rendered_items() end)
+    end)
+
+    return newItem.unique, kind
+end
+
+local OriginalRouterGet = load("RouterClient").get
+load("RouterClient").get = function(endpoint)
+    if endpoint == "ToolAPI/Equip" then
+        return { InvokeServer = function(_, uid, opts)
+            local pet = SpawnedPets[uid]
+            if not pet then return OriginalRouterGet("ToolAPI/Equip"):InvokeServer(uid, opts) end
+            BPEquip(pet.data, opts); return true, { action = "equip", is_server = true }
+        end }
+    elseif endpoint == "ToolAPI/Unequip" then
+        return { InvokeServer = function(_, uid)
+            local pet = SpawnedPets[uid]
+            if not pet then return OriginalRouterGet("ToolAPI/Unequip"):InvokeServer(uid) end
+            BPUnequip(pet.data); return true, { action = "unequip", is_server = true }
+        end }
+    elseif endpoint == "AdoptAPI/RidePet" then
+        return { InvokeServer = function(_, pd)
+            local pet = SpawnedPets[pd.pet_unique]
+            if not pet then return OriginalRouterGet("AdoptAPI/RidePet"):InvokeServer(pd) end
+            BPMount(pd.pet_unique, "PlayerRidingPet", "PetBeingRidden"); return true
+        end }
+    elseif endpoint == "AdoptAPI/FlyPet" then
+        return { InvokeServer = function(_, pd)
+            local pet = SpawnedPets[pd.pet_unique]
+            if not pet then return OriginalRouterGet("AdoptAPI/FlyPet"):InvokeServer(pd) end
+            BPMount(pd.pet_unique, "PlayerFlyingPet", "PetBeingFlown"); return true
+        end }
+    elseif endpoint == "AdoptAPI/ExitSeatStates" then
+        return { FireServer = function()
+            if CurrentRideId then BPDismount(); return true end
+            return OriginalRouterGet("AdoptAPI/ExitSeatStates"):FireServer()
+        end }
+    elseif endpoint == "SettingsAPI/SetPetRoleplayName" then
+        return { InvokeServer = function(_, uid, name)
+            local pet = SpawnedPets[uid]
+            if not pet then return OriginalRouterGet("SettingsAPI/SetPetRoleplayName"):InvokeServer(uid, name) end
+            pcall(function() setthreadidentity(2) end)
+            local inv = ClientData.get("inventory")
+            if inv and inv.pets and inv.pets[uid] then inv.pets[uid].properties.rp_name = name end
+            if pet.data then pet.data.properties.rp_name = name end
+            pcall(function() setthreadidentity(8) end)
+            BPUpdateData("pet_char_wrappers", function(ws)
+                for _, w in pairs(ws) do if w.pet_unique == uid then w.rp_name = name end end
+                return ws
+            end)
+            return true
+        end }
+    else
+        return OriginalRouterGet(endpoint)
+    end
+end
+
+-- Unequip existing pets on load
+for _, w in pairs(ClientData.get("pet_char_wrappers") or {}) do
+    pcall(function() OriginalRouterGet("ToolAPI/Unequip"):InvokeServer(w.pet_unique) end)
+end
+
+-- Direct RemoteFunction hook for DoNeonFusion.
+local function findNeonFusionRF()
+    for _, v in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+        if v:IsA("RemoteFunction") and (
+            v.Name:lower():find("neon") or v.Name:lower():find("fusion")
+        ) then return v end
+    end
+end
+
+local DoNeonFusionRF = game:GetService("ReplicatedStorage"):FindFirstChild("DoNeonFusion", true)
+    or findNeonFusionRF()
+
+print("DoNeonFusionRF found:", DoNeonFusionRF)
+
+if DoNeonFusionRF then
+    local mt = getrawmetatable(DoNeonFusionRF)
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
+    mt.__namecall = function(self, ...)
+        if self == DoNeonFusionRF and getnamecallmethod() == "InvokeServer" then
+            local args = {...}
+            local placedUniques = args[1]
+            local newUnique, newKind = ClientSideDoNeonFusion(placedUniques)
+            if newUnique then return newUnique, newKind end
+        end
+        return oldNamecall(self, ...)
+    end
+    setreadonly(mt, true)
+end
+local spawnedPetIds = {}
+
+
+
+-- Pet name label (matches Control tab section label style)
+-- Pet name box
+petNameBox = Instance.new("TextBox")
+petNameBox.Size = UDim2.new(1,0,0,26); petNameBox.BackgroundColor3 = Color3.fromRGB(35,35,45)
+petNameBox.Text = ""; petNameBox.PlaceholderText = "Pet name..."
+petNameBox.Font = Enum.Font.SourceSans; petNameBox.TextSize = 12
+petNameBox.TextColor3 = Color3.fromRGB(255,255,255); petNameBox.PlaceholderColor3 = Color3.fromRGB(90,90,110)
+petNameBox.ClearTextOnFocus = false; petNameBox.TextXAlignment = Enum.TextXAlignment.Left
+petNameBox.LayoutOrder = 1; petNameBox.Parent = petsFrame
+Instance.new("UICorner", petNameBox).CornerRadius = UDim.new(0,5)
+do
+local petNamePad = Instance.new("UIPadding"); petNamePad.PaddingLeft = UDim.new(0,8); petNamePad.PaddingRight = UDim.new(0,8); petNamePad.Parent = petNameBox
+local petNameStroke = Instance.new("UIStroke"); petNameStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+petNameStroke.Color = Color3.fromRGB(80,80,100); petNameStroke.Thickness = 1; petNameStroke.Parent = petNameBox
+petNameBox.Focused:Connect(function() TweenService:Create(petNameStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(108,75,171),Thickness=1.5}):Play() end)
+petNameBox.FocusLost:Connect(function() TweenService:Create(petNameStroke,TweenInfo.new(0.2),{Color=Color3.fromRGB(80,80,100),Thickness=1}):Play() end)
+local isAutoCaping = false
+local function titleCase(str) return str:gsub("(%a)([%w_']*)", function(a,b) return a:upper()..b:lower() end) end
+petNameBox:GetPropertyChangedSignal("Text"):Connect(function()
+    if isAutoCaping then return end
+    local c = titleCase(petNameBox.Text)
+    if c ~= petNameBox.Text then isAutoCaping=true; petNameBox.Text=c; isAutoCaping=false end
+end)
+end
+
+-- Flags row — 4 pill toggle buttons with breathing room
+petFlags = { F = false, R = false, N = false, M = false }
+flagButtonRefs = {}
+
+flagsRow = Instance.new("Frame")
+flagsRow.Size = UDim2.new(1,0,0,28); flagsRow.BackgroundTransparency = 1
+flagsRow.LayoutOrder = 2; flagsRow.Parent = petsFrame
+do
+local flagsLayout = Instance.new("UIListLayout"); flagsLayout.FillDirection = Enum.FillDirection.Horizontal
+flagsLayout.SortOrder = Enum.SortOrder.LayoutOrder; flagsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+flagsLayout.Padding = UDim.new(0,8); flagsLayout.Parent = flagsRow
+end
+
+flagDefs = {
+    { key="F", label="Fly",  off=Color3.fromRGB(30,30,45), on=Color3.fromRGB(50,100,220),  order=1 },
+    { key="R", label="Ride", off=Color3.fromRGB(30,30,45), on=Color3.fromRGB(200,50,50),   order=2 },
+    { key="N", label="Neon", off=Color3.fromRGB(30,30,45), on=Color3.fromRGB(30,180,90),   order=3 },
+    { key="M", label="Mega", off=Color3.fromRGB(30,30,45), on=Color3.fromRGB(130,50,210),  order=4 },
+}
+
+-- Age sets
+do
+local ageSetNormal = {{label="NB",value=1},{label="Jr",value=2},{label="PT",value=3},{label="T",value=4},{label="PoT",value=5},{label="FG",value=6}}
+local ageSetNeon   = {{label="Nw",value=1},{label="Sp",value=2},{label="Lu",value=3},{label="Tw",value=4},{label="Sh",value=5},{label="Ra",value=6}}
+local ageSetMega   = {{label="NM",value=1},{label="SM",value=2},{label="LM",value=3},{label="TM",value=4},{label="ShM",value=5},{label="RM",value=6}}
+selectedAge = 6
+ageButtonRefs = {}
+
+ageRow = Instance.new("Frame")
+ageRow.Size = UDim2.new(1,0,0,24); ageRow.BackgroundTransparency = 1
+ageRow.LayoutOrder = 3; ageRow.Parent = petsFrame
+do
+local ageLayout = Instance.new("UIListLayout"); ageLayout.FillDirection = Enum.FillDirection.Horizontal
+ageLayout.SortOrder = Enum.SortOrder.LayoutOrder; ageLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+ageLayout.Padding = UDim.new(0,5); ageLayout.Parent = ageRow
+end
+
+buildAgeRow = function()
+    for _, ref in ipairs(ageButtonRefs) do if ref.btn and ref.btn.Parent then ref.btn:Destroy() end end
+    ageButtonRefs = {}
+    local ageSet = petFlags.M and ageSetMega or petFlags.N and ageSetNeon or ageSetNormal
+    if selectedAge > #ageSet then selectedAge = #ageSet end
+    for _, entry in ipairs(ageSet) do
+        local isOn = entry.value == selectedAge
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0,26,1,0); btn.BackgroundColor3 = isOn and Color3.fromRGB(70,45,110) or Color3.fromRGB(35,35,48)
+        btn.Text = entry.label; btn.Font = Enum.Font.GothamBold; btn.TextSize = 9
+        btn.TextColor3 = isOn and Color3.fromRGB(255,255,255) or Color3.fromRGB(130,130,150)
+        btn.Parent = ageRow
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+        local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Color = isOn and Color3.fromRGB(108,75,171) or Color3.fromRGB(60,60,80); s.Thickness = 1; s.Parent = btn
+        local cv = entry.value
+        btn.MouseButton1Click:Connect(function()
+            selectedAge = cv
+            for _, ref in ipairs(ageButtonRefs) do
+                local on = ref.value == selectedAge
+                TweenService:Create(ref.btn,TweenInfo.new(0.12),{BackgroundColor3=on and Color3.fromRGB(70,45,110) or Color3.fromRGB(35,35,48)}):Play()
+                ref.btn.TextColor3 = on and Color3.fromRGB(255,255,255) or Color3.fromRGB(130,130,150)
+                TweenService:Create(ref.stroke,TweenInfo.new(0.12),{Color=on and Color3.fromRGB(108,75,171) or Color3.fromRGB(60,60,80)}):Play()
+            end
+        end)
+        table.insert(ageButtonRefs, {btn=btn, stroke=s, value=entry.value})
+    end
+end -- buildAgeRow
+end -- age sets do
+end -- pets do 1a
+do -- pets do 1b
+buildAgeRow()
+
+for _, def in ipairs(flagDefs) do
+    local isOn = petFlags[def.key]
+    local fb = Instance.new("TextButton")
+    fb.Size = UDim2.new(0,40,1,0); fb.BackgroundColor3 = isOn and def.on or def.off
+    fb.Text = def.label; fb.Font = Enum.Font.GothamBold; fb.TextSize = 10
+    fb.TextColor3 = isOn and Color3.fromRGB(255,255,255) or Color3.fromRGB(120,120,140)
+    fb.LayoutOrder = def.order; fb.Parent = flagsRow
+    Instance.new("UICorner", fb).CornerRadius = UDim.new(0,5)
+    local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Color = isOn and def.on or Color3.fromRGB(60,60,80); s.Thickness = 1; s.Parent = fb
+    flagButtonRefs[def.key] = {btn=fb, stroke=s, def=def}
+    local ck = def.key
+    fb.MouseButton1Click:Connect(function()
+        if ck=="M" and not petFlags.M then petFlags.N=false end
+        if ck=="N" and not petFlags.N then petFlags.M=false end
+        petFlags[ck] = not petFlags[ck]
+        for k, ref in pairs(flagButtonRefs) do
+            local on = petFlags[k]
+            TweenService:Create(ref.btn,TweenInfo.new(0.12),{BackgroundColor3=on and ref.def.on or ref.def.off}):Play()
+            ref.btn.TextColor3 = on and Color3.fromRGB(255,255,255) or Color3.fromRGB(120,120,140)
+            TweenService:Create(ref.stroke,TweenInfo.new(0.12),{Color=on and ref.def.on or Color3.fromRGB(60,60,80)}):Play()
+        end
+        buildAgeRow()
+    end)
+end
+
+-- Action buttons
+makePetActionBtn = function(labelText, xPos, parent)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.48,0,1,0); btn.Position = UDim2.new(xPos,0,0,0)
+    btn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+    btn.Text = labelText; btn.Font = Enum.Font.FredokaOne; btn.TextSize = 11
+    btn.TextColor3 = Color3.fromRGB(255,255,255); btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0,4)
+    local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Color = Color3.fromRGB(108,75,171); s.Thickness = 2; s.Transparency = 0.3; s.Parent = btn
+    return btn
+end
+
+petActionRow = Instance.new("Frame")
+petActionRow.Size = UDim2.new(1,0,0,24); petActionRow.BackgroundTransparency = 1
+petActionRow.LayoutOrder = 4; petActionRow.Parent = petsFrame
+
+spawnInvBtn = makePetActionBtn("Spawn in Inv", 0,    petActionRow)
+addTradeBtn = makePetActionBtn("Add to Trade", 0.52, petActionRow)
+
+-- Spawn All Variants button
+spawnAllBtn = Instance.new("TextButton")
+spawnAllBtn.Size = UDim2.new(1,0,0,24); spawnAllBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+spawnAllBtn.Text = "Spawn All Variants"; spawnAllBtn.Font = Enum.Font.FredokaOne; spawnAllBtn.TextSize = 11
+spawnAllBtn.TextColor3 = Color3.fromRGB(255,255,255); spawnAllBtn.LayoutOrder = 5; spawnAllBtn.Parent = petsFrame
+Instance.new("UICorner", spawnAllBtn).CornerRadius = UDim.new(0,4)
+local savStroke = Instance.new("UIStroke"); savStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+savStroke.Color = Color3.fromRGB(50,180,80); savStroke.Thickness = 1.5; savStroke.Transparency = 0.3; savStroke.Parent = spawnAllBtn
+
+findPetKind = function(name)
+    for catName, catTable in pairs(InventoryDB) do
+        if catName == "pets" then
+            for id, item in pairs(catTable) do
+                if item.name:lower() == name:lower() then return id end
+            end
+        end
+    end
+    return nil
+end
+
+end
+do
+spawnInvBtn.MouseButton1Click:Connect(function()
+    local name = petNameBox.Text
+    if name == "" then
+        if HintApp then HintApp:hint({ text = "Enter a pet name first.", length = 2, overridable = true }) end
+        return
+    end
+    local foundKind = findPetKind(name)
+    if not foundKind then
+        if HintApp then HintApp:hint({ text = "Pet not found: " .. name, length = 3, overridable = true }) end
+        return
+    end
+    local props = {
+        flyable   = petFlags.F,
+        rideable  = petFlags.R,
+        neon      = petFlags.N,
+        mega_neon = petFlags.M,
+        age       = selectedAge,
+        xp        = 0,
+        rp_name   = "",
+    }
+    local item = BPCreateInventoryItem(foundKind, "pets", props)
+    if item then
+        spawnedPetIds[item.unique] = true
+        if HintApp then HintApp:hint({ text = name .. " spawned! Equip from backpack.", length = 3, overridable = true }) end
+    else
+        if HintApp then HintApp:hint({ text = "Failed to spawn " .. name, length = 3, overridable = true }) end
+    end
+end)
+
+addTradeBtn.MouseButton1Click:Connect(function()
+    local name = petNameBox.Text
+    if name == "" then
+        if HintApp then HintApp:hint({ text = "Enter a pet name first.", length = 2, overridable = true }) end
+        return
+    end
+    if not mockState.active or not mockState.trade then
+        if HintApp then HintApp:hint({ text = "Start a trade first.", length = 2, overridable = true }) end
+        return
+    end
+    task.spawn(function()
+        local flags = { F = petFlags.F, R = petFlags.R, N = petFlags.N, M = petFlags.M }
+        local ok = addPetToPartnerOffer(name, flags)
+        if not ok and HintApp then
+            HintApp:hint({ text = "Pet not found or trade full.", length = 3, overridable = true })
+        end
+    end)
+end)
+
+-- Spawn Random Pets button
+spawnRandBtn = Instance.new("TextButton")
+spawnRandBtn.Size = UDim2.new(1,0,0,24); spawnRandBtn.BackgroundColor3 = Color3.fromRGB(35,35,48)
+spawnRandBtn.Text = "Spawn 50 Random Pets"; spawnRandBtn.Font = Enum.Font.FredokaOne; spawnRandBtn.TextSize = 11
+spawnRandBtn.TextColor3 = Color3.fromRGB(255,255,255); spawnRandBtn.LayoutOrder = 6; spawnRandBtn.Parent = petsFrame
+Instance.new("UICorner", spawnRandBtn).CornerRadius = UDim.new(0,4)
+local srpStroke = Instance.new("UIStroke"); srpStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+srpStroke.Color = Color3.fromRGB(60,130,200); srpStroke.Thickness = 1.5; srpStroke.Transparency = 0.3; srpStroke.Parent = spawnRandBtn
+
+local spawnRandBusy = false
+spawnRandBtn.MouseButton1Click:Connect(function()
+    if spawnRandBusy then return end
+    spawnRandBusy = true
+    -- Build kind list from ALL pets EXCLUDING high tier pets
+    local highTierKinds = {}
+    for _, petName in ipairs(HIGH_TIER_PETS) do
+        local kind = findPetKind(petName)
+        if kind then highTierKinds[kind] = true end
+    end
+    local allPetKinds = {}
+    for id, item in pairs(InventoryDB.pets or {}) do
+        if item.name and not highTierKinds[id] then
+            table.insert(allPetKinds, id)
+        end
+    end
+    if #allPetKinds == 0 then spawnRandBusy = false; return end
+    for _ = 1, 50 do
+        local id = allPetKinds[math.random(1, #allPetKinds)]
+        BPCreateInventoryItem(id, "pets", {
+            flyable   = petFlags.F,
+            rideable  = petFlags.R,
+            neon      = petFlags.N,
+            mega_neon = petFlags.M,
+            age       = selectedAge, xp=0, rp_name="",
+        })
+    end
+    if HintApp then HintApp:hint({ text = "50 random pets spawned!", length = 3, overridable = true }) end
+    spawnRandBusy = false
+end)
+local function _spawnAllVariantsRun()
+    if spawnAllBusy then return end
+    spawnAllBusy = true
+    spawnAllBtn.Text = "Spawning Variants..."
+    task.spawn(function()
+        -- Fixed variants every high tier pet gets
+        local fixedVariants = {
+            { F=true,  R=true,  N=false, M=true  }, -- MFR
+            { F=true,  R=true,  N=true,  M=false }, -- NFR
+            { F=true,  R=true,  N=false, M=false }, -- FR
+        }
+        local function randFlags()
+            local f = math.random(0,1)==1; local r = math.random(0,1)==1
+            local roll = math.random(1,3)
+            return {F=f, R=r, N=roll==2, M=roll==3}
+        end
+        local count = 0
+        for _, petName in ipairs(HIGH_TIER_PETS) do
+            local foundKind = findPetKind(petName)
+            if foundKind then
+                -- 1 of each fixed variant
+                for _, flags in ipairs(fixedVariants) do
+                    BPCreateInventoryItem(foundKind, "pets", { flyable=flags.F, rideable=flags.R, neon=flags.N, mega_neon=flags.M, age=6, xp=0, rp_name="" })
+                    count = count + 1
+                end
+                -- 2 random variants unique to this pet
+                for _ = 1, 2 do
+                    local flags = randFlags()
+                    BPCreateInventoryItem(foundKind, "pets", { flyable=flags.F, rideable=flags.R, neon=flags.N, mega_neon=flags.M, age=6, xp=0, rp_name="" })
+                    count = count + 1
+                end
+            end
+        end
+        if HintApp then HintApp:hint({ text = count .. " pets spawned!", length = 3, overridable = true }) end
+        spawnAllBtn.Text = "Spawn All Variants"
+        spawnAllBusy = false
+    end)
+end
+spawnAllBtn.MouseButton1Click:Connect(_spawnAllVariantsRun)
+-- Expose for Setup Live (Misc tab)
+_G._setupLiveRunSpawnAllVariants = _spawnAllVariantsRun
+_G._setupLiveSpawnAllVariantsBtn = spawnAllBtn
+
+-- DRAGGING
+local dragging, dragStart, startPos
+mainFrame.InputBegan:Connect(function(input)
+    if not dragEnabled then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = mainFrame.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local delta = input.Position - dragStart
+    mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+delta.X, startPos.Y.Scale, startPos.Y.Offset+delta.Y)
+    blackFrame.Position = UDim2.new(mainFrame.Position.X.Scale, mainFrame.Position.X.Offset-3, mainFrame.Position.Y.Scale, mainFrame.Position.Y.Offset-3)
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+end)
+end -- pets do block 2
+setActiveTab("Control")
+
+-- =====================================================================
+-- FAKE PLAYER SPAWNER ENGINE
+-- Runs inside task.spawn so it gets its own Lua function scope and
+-- its own 200-local register budget, completely separate from the
+-- main chunk above. Exposes _G._SpawnFakePlayer and _G._DeleteFakePlayers
+-- which the Spawn tab buttons call.
+-- =====================================================================
+task.spawn(function()
+    local Players       = game:GetService("Players")
+    local HttpService   = game:GetService("HttpService")
+    local RunService    = game:GetService("RunService")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Fsys     = require(ReplicatedStorage:WaitForChild("Fsys"))
+    local load     = Fsys.load
+    local UIManager    = load("UIManager")
+    local InventoryDB  = load("InventoryDB")
+    local ClientData   = load("ClientData")
+    local HintApp      = UIManager.apps.HintApp
+
+    local fakePlayerIds = {}
+    _G.fakePlayerIds = fakePlayerIds
+
+    local FakePlayers    = {}
+    local FakePetReg     = {}
+
+    -- Patch SettingsHelper so fake user IDs never crash server calls
+    pcall(function()
+        local SH = load("SettingsHelper")
+        local orig = SH.get_setting_server
+        SH.get_setting_server = function(player, settingName, ...)
+            if player and player.UserId then
+                if fakePlayerIds[player.UserId] then return false end
+                if not Players:GetPlayerByUserId(player.UserId) then return false end
+            end
+            local args = {...}
+            local ok, r = pcall(function() return orig(player, settingName, table.unpack(args)) end)
+            return ok and r or false
+        end
+    end)
+
+    -- Patch FamilyHelper so fake players never count as family
+    pcall(function()
+        local FH = load("FamilyHelper")
+        local oAFF  = FH.are_friends_family
+        local oIMFF = FH.is_my_friend_or_family
+        local oAFBF = FH.are_family_because_friends
+        local oIMFBF= FH.is_my_family_because_friend
+        FH.are_friends_family = function(a,b)
+            if a and b and (fakePlayerIds[a.UserId] or fakePlayerIds[b.UserId]) then return false end
+            return oAFF(a,b)
+        end
+        FH.is_my_friend_or_family = function(p)
+            if p and fakePlayerIds[p.UserId] then return false end
+            return oIMFF(p)
+        end
+        FH.are_family_because_friends = function(a,b)
+            if a and b and (fakePlayerIds[a.UserId] or fakePlayerIds[b.UserId]) then return false end
+            return oAFBF(a,b)
+        end
+        FH.is_my_family_because_friend = function(p)
+            if p and fakePlayerIds[p.UserId] then return false end
+            return oIMFBF(p)
+        end
+    end)
+
+    -- Block InteractionsEngine from picking up fake pet parts
+    pcall(function()
+        local IE = load("InteractionsEngine")
+        local origReg = IE.register
+        IE.register = function(self, data)
+            if data and data.part then
+                local check = data.part
+                while check do
+                    if check:GetAttribute("IsFakePet") == true and check.Parent then return end
+                    check = check.Parent
+                end
+            end
+            return origReg(self, data)
+        end
+    end)
+
+    -- Neon helpers
+    local function applyNeon(petModel, kind)
+        pcall(function()
+            local petData = InventoryDB.pets and InventoryDB.pets[kind]
+            if not petData or not petData.neon_parts then return end
+            local mi = petModel:FindFirstChild("PetModel") or petModel
+            local ok, PR = pcall(load, "new:PetRigs")
+            if not ok or not PR then return end
+            for neonPart, cfg in pairs(petData.neon_parts) do
+                local part = PR.get(mi).get_geo_part(mi, neonPart)
+                if part then
+                    part.Material = Enum.Material.Neon
+                    if cfg.Color then part.Color = cfg.Color end
+                end
+            end
+        end)
+    end
+
+    local function applyMegaNeon(petModel, kind)
+        pcall(function()
+            local petData = InventoryDB.pets and InventoryDB.pets[kind]
+            if not petData or not petData.neon_parts then return end
+            local mi = petModel:FindFirstChild("PetModel") or petModel
+            local ok, PR = pcall(load, "new:PetRigs")
+            if not ok or not PR then return end
+            for neonPart, cfg in pairs(petData.neon_parts) do
+                local part = PR.get(mi).get_geo_part(mi, neonPart)
+                if part then
+                    part.Material = Enum.Material.Neon
+                    if cfg.Color then
+                        local h,s,v = cfg.Color:ToHSV()
+                        part.Color = Color3.fromHSV(h, math.min(s*1.3,1), math.min(v*1.4,1))
+                    else
+                        part.Color = Color3.fromRGB(170,0,255)
+                    end
+                end
+            end
+        end)
+    end
+
+    -- ClientData update helper
+    local function updateData(key, action)
+        pcall(function() setthreadidentity(2) end)
+        local cur = ClientData.get(key)
+        local cloned = table.clone(cur or {})
+        local result = action(cloned)
+        ClientData.predict(key, result)
+        pcall(function() setthreadidentity(8) end)
+    end
+
+    -- Pet model cache
+    local petModelCache = {}
+    local function fetchPetModel(kind)
+        if petModelCache[kind] then return petModelCache[kind] end
+        local ok, model = pcall(function()
+            return load("DownloadClient").promise_download_copy("Pets", kind):expect()
+        end)
+        if ok and model then petModelCache[kind] = model; return model end
+        return nil
+    end
+
+    -- Animation manager to keep riding anim alive on fake pets
+    local animRunning = false
+    local function startAnimManager()
+        if animRunning then return end
+        animRunning = true
+        task.spawn(function()
+            while animRunning do
+                task.wait(0.3)
+                for _, pd in ipairs(FakePetReg) do
+                    if pd and pd.model and pd.model.Parent and pd.character and pd.character.Parent then
+                        pcall(function()
+                            local hum = pd.character:FindFirstChild("Humanoid")
+                            if not hum then return end
+                            local anim = hum:FindFirstChild("Animator")
+                            if not anim then return end
+                            if pd.hasRidingPet then
+                                local riding = false
+                                for _, t in ipairs(anim:GetPlayingAnimationTracks()) do
+                                    if t.Animation.AnimationId:find("PlayerRidingPet") or t.Animation.AnimationId:find("507766666") then
+                                        riding = true; break
+                                    end
+                                end
+                                if not riding then
+                                    if pd.ridingAnim then pd.ridingAnim:Stop() end
+                                    local ok2, AM = pcall(load, "AnimationManager")
+                                    if ok2 and AM then
+                                        pd.ridingAnim = anim:LoadAnimation(AM.get_track("PlayerRidingPet"))
+                                        pd.ridingAnim.Looped = true; pd.ridingAnim:Play()
+                                        hum.Sit = true
+                                    end
+                                end
+                            end
+                            if pd.wrapper then
+                                if pd.wrapper.mega_neon then applyMegaNeon(pd.model, pd.wrapper.pet_id)
+                                elseif pd.wrapper.neon then applyNeon(pd.model, pd.wrapper.pet_id) end
+                            end
+                        end)
+                    end
+                end
+            end
+        end)
+    end
+
+    local function stopAnimManager()
+        animRunning = false
+        for _, pd in ipairs(FakePetReg) do
+            pcall(function() if pd.ridingAnim then pd.ridingAnim:Stop() end end)
+        end
+    end
+
+    local function createFakePetOwner(char, name, uid)
+        return setmetatable({Name=name, DisplayName=name, UserId=uid, Character=char},{
+            __index = function(t,k)
+                if k=="Parent" then return Players end
+                if k=="IsA" then return function(_,c) return c=="Player" end end
+                if k=="GetChildren" then return function() return {} end end
+                return rawget(t,k)
+            end,
+            __tostring = function() return name end,
+        })
+    end
+
+    -- Main spawn function
+    local function spawnFakePlayer(partnerName, partnerId, fakePetData, petFlags)
+        local maxRetries, tries = 3, 0
+        local function attempt()
+            tries = tries + 1
+            fakePlayerIds[partnerId] = true
+            _G.fakePlayerIds[partnerId] = true
+
+            local folder = Instance.new("Folder")
+            folder.Name = "fake_folder_"..partnerName
+            folder.Parent = workspace
+
+            local character = Players:CreateHumanoidModelFromUserId(partnerId)
+            local localChar = Players.LocalPlayer.Character
+            character:SetPrimaryPartCFrame(
+                localChar.HumanoidRootPart.CFrame * CFrame.new(math.random(-10,10),0,math.random(-10,10))
+            )
+            local hum = character:WaitForChild("Humanoid")
+            hum.DisplayDistanceType  = Enum.HumanoidDisplayDistanceType.None
+            hum.HealthDisplayType    = Enum.HumanoidHealthDisplayType.AlwaysOff
+            hum.HealthDisplayDistance = 0
+            character.Parent = folder
+
+            if fakePetData ~= nil then
+                local petCreated = false
+                local ok = pcall(function()
+                    local kind = fakePetData.kind
+                    local petModel = fetchPetModel(kind)
+                    if not petModel then return end
+                    petModel = petModel:Clone()
+                    petModel:SetAttribute("IsFakePet", true)
+                    if petFlags then
+                        if petFlags.M then applyMegaNeon(petModel, kind)
+                        elseif petFlags.N then applyNeon(petModel, kind) end
+                    end
+                    petModel.Parent = folder
+                    petModel:SetPrimaryPartCFrame(character.HumanoidRootPart.CFrame)
+                    petModel:ScaleTo(2)
+                    for _, p in ipairs(petModel:GetDescendants()) do
+                        if p:IsA("BasePart") then p:SetAttribute("IsFakePet", true) end
+                    end
+                    local ridePos = petModel:FindFirstChild("RidePosition", true)
+                    if ridePos then
+                        local att = Instance.new("Attachment")
+                        att.Parent = ridePos; att.Position = Vector3.new(0,1.237,0); att.Name = "SourceAttachment"
+                        local rc = Instance.new("RigidConstraint")
+                        rc.Name = "StateConnection"; rc.Attachment0 = att
+                        rc.Attachment1 = character.PrimaryPart.RootAttachment; rc.Parent = character
+                    end
+                    local ridingAnim
+                    local ok2, AM = pcall(load, "AnimationManager")
+                    if ok2 and AM then
+                        ridingAnim = character.Humanoid.Animator:LoadAnimation(AM.get_track("PlayerRidingPet"))
+                        ridingAnim.Looped = true; ridingAnim:Play()
+                    end
+                    character.Humanoid.Sit = true
+                    for _, desc in pairs(character:GetDescendants()) do
+                        if desc:IsA("BasePart") and not desc.Massless then
+                            desc.Massless = true; desc:SetAttribute("HaveMass", true)
+                        end
+                    end
+                    local owner = createFakePetOwner(character, partnerName, partnerId)
+                    local wrapper = {
+                        char=petModel, mega_neon=petFlags and petFlags.M or false,
+                        neon=petFlags and petFlags.N or false,
+                        player=owner, entity_controller=owner, controller=owner,
+                        rp_name="", pet_trick_level=math.random(1,5),
+                        pet_unique=HttpService:GenerateGUID(false), pet_id=kind,
+                        location={full_destination_id="housing",destination_id="housing",house_owner=owner},
+                        pet_progression={age=math.random(1,900000),percentage=math.random(0.01,0.99)},
+                        are_colors_sealed=false, is_pet=true,
+                    }
+                    local state = {
+                        char=petModel, player=owner, store_key="pet_state_managers",
+                        is_sitting=false, chars_connected_to_me={}, states={{id="PetBeingRidden"}},
+                    }
+                    updateData("pet_char_wrappers", function(ws)
+                        wrapper.unique=#ws+1; wrapper.index=#ws+1; ws[#ws+1]=wrapper; return ws
+                    end)
+                    updateData("pet_state_managers", function(ms)
+                        ms[#ms+1]=state; return ms
+                    end)
+                    table.insert(FakePetReg, {
+                        wrapper=wrapper, state=state, model=petModel, character=character,
+                        hasRidingPet=true, owner=owner, ridingAnim=ridingAnim, folder=folder,
+                    })
+                    startAnimManager()
+                    petCreated = true
+                end)
+                if not ok or not petCreated then
+                    folder:Destroy()
+                    for i,f in ipairs(FakePlayers) do if f==folder then table.remove(FakePlayers,i); break end end
+                    if tries < maxRetries then task.wait(0.5); return attempt() else return false end
+                end
+            else
+                local a = Instance.new("Animation")
+                a.AnimationId = "http://www.roblox.com/asset/?id=507766666"
+                local t = character.Humanoid.Animator:LoadAnimation(a)
+                t.Looped = true; t:Play()
+            end
+
+            -- Noclip
+            for _, p in ipairs(character:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    p.CanCollide=false; p.CanTouch=false; p.CanQuery=false
+                    pcall(function() p.CollisionGroup="Noclip" end)
+                end
+            end
+
+            -- PlayerNameApp label
+            pcall(function() UIManager.apps.PlayerNameApp:add_npc_id(character, partnerName) end)
+
+            -- Interaction menu
+            local hrp = character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function()
+                    local ok3, IE = pcall(load, "InteractionsEngine")
+                    if not ok3 or not IE then return end
+                    IE:register({
+                        text=partnerName, part=hrp,
+                        on_selected={
+                            {text="Profile", on_selected=function()
+                                pcall(function() UIManager.apps.PlayerProfileApp:open_player_profile_for_user_id(partnerId) end)
+                            end},
+                            {text="Trade", on_selected=function()
+                                pcall(function()
+                                    if HintApp then HintApp:hint({text="Trade request sent to "..partnerName,length=3,overridable=true}) end
+                                end)
+                            end},
+                            {text="Give Item...", on_selected=function() end},
+                            {text="Mute",        on_selected=function() end},
+                        },
+                    })
+                end)
+            end
+
+            table.insert(FakePlayers, folder)
+            folder:SetAttribute("IsFakePlayer", true)
+            folder:SetAttribute("PartnerName",  partnerName)
+            folder:SetAttribute("PartnerId",    partnerId)
+            if HintApp then HintApp:hint({text="Spawned: "..partnerName,length=2,overridable=true}) end
+            return true
+        end
+        return attempt()
+    end
+
+    local function deleteAllFakePlayers()
+        stopAnimManager()
+        for _, pd in ipairs(FakePetReg) do
+            if pd and pd.model then
+                pcall(function()
+                    updateData("pet_char_wrappers", function(ws)
+                        for i=#ws,1,-1 do if ws[i].pet_unique==pd.wrapper.pet_unique then table.remove(ws,i) end end
+                        return ws
+                    end)
+                end)
+                pcall(function()
+                    updateData("pet_state_managers", function(ms)
+                        for i=#ms,1,-1 do if ms[i].char==pd.model then table.remove(ms,i) end end
+                        return ms
+                    end)
+                end)
+            end
+        end
+        for _, f in pairs(FakePlayers) do if f and f.Parent then f:Destroy() end end
+        FakePlayers = {}
+        FakePetReg  = {}
+        fakePlayerIds = {}
+        _G.fakePlayerIds = {}
+        if HintApp then HintApp:hint({text="All fake players deleted.",length=3,overridable=true}) end
+    end
+
+    -- Expose to Spawn tab buttons
+    _G._SpawnFakePlayer    = spawnFakePlayer
+    _G._DeleteFakePlayers  = deleteAllFakePlayers
+end)
+
+-- =====================================================================
+-- HOOK addPetToPartnerOffer FOR SPIN-ON-ADD
+-- Wraps the existing function so that whenever the partner adds an item
+-- and _G._SpinOnAdd is true, the spinner wheel pops up.
+-- Done after everything is defined so the upvalue is already set.
+-- =====================================================================
+do
+    -- addPetToPartnerOffer is a local in the outer chunk — we hook it
+    -- by patching via _G after the fact isn't possible for a local,
+    -- so we hook TradeApp._overwrite_local_trade_state instead:
+    -- every time the partner offer gains a new item while SpinOnAdd is ON,
+    -- we fire showWheel.
+    local lastPartnerCount = 0
+    local origOverwrite = TradeApp._overwrite_local_trade_state
+    TradeApp._overwrite_local_trade_state = function(self, newState, ...)
+        local result = origOverwrite(self, newState, ...)
+        pcall(function()
+            if _G._SpinOnAdd and newState and mockState and mockState.active then
+                local partnerItems = (newState.recipient == Players.LocalPlayer)
+                    and newState.sender_offer or newState.recipient_offer
+                local count = partnerItems and #(partnerItems.items or {}) or 0
+                if count > lastPartnerCount and _G._ShowSpinWheel then
+                    lastPartnerCount = count
+                    _G._ShowSpinWheel()
+                end
+            end
+            if not (newState and mockState and mockState.active) then
+                lastPartnerCount = 0
+            end
+        end)
+        return result
+    end
+end
+
+-- =====================================================================
+-- SPINNER SYSTEM ENGINE
+-- Self-contained in task.spawn for its own 200-local budget.
+-- Hijacks the DailyLoginApp UI (same technique as the source script).
+-- Exposes _G._ShowSpinWheel.
+-- =====================================================================
+task.spawn(function()
+    local Players         = game:GetService("Players")
+    local TweenService    = game:GetService("TweenService")
+    local UserInputService= game:GetService("UserInputService")
+    local RunService      = game:GetService("RunService")
+    local HttpService     = game:GetService("HttpService")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Fsys       = require(ReplicatedStorage:WaitForChild("Fsys"))
+    local load       = Fsys.load
+    local UIManager  = load("UIManager")
+    local InventoryDB= load("InventoryDB")
+    local DialogApp  = UIManager.apps.DialogApp
+    local TradeApp   = UIManager.apps.TradeApp
+
+    -- Wait for DailyLoginApp to exist
+    local PlayerGui     = Players.LocalPlayer:WaitForChild("PlayerGui")
+    local DailyLoginGui = PlayerGui:WaitForChild("DailyLoginApp", 30)
+    if not DailyLoginGui then return end
+    local MainFrame = DailyLoginGui:WaitForChild("Frame", 10)
+    if not MainFrame then return end
+
+    local ss = {}  -- spinnerSystem table
+
+    pcall(function() ss.SoundPlayer = load("SoundPlayer") end)
+    ss.app = UIManager.apps.DailyLoginApp
+    if not ss.app then return end
+
+    local Templates = ReplicatedStorage.Resources.UI_Resources.Templates
+    ss.ItemImageTemplate = Templates.ItemImageTemplate
+
+    ss.THEME = {
+        cardDefaultBG       = Color3.fromRGB(230,240,255),
+        cardDefaultStroke   = Color3.fromRGB(200,80,80),
+        cardHighlightBG     = Color3.fromRGB(200,255,210),
+        cardHighlightStroke = Color3.fromRGB(74,198,85),
+        cardWinFlashBG      = Color3.fromRGB(255,248,215),
+        cardWinFlashStroke  = Color3.fromRGB(255,200,50),
+        rewardBoxDefault    = Color3.fromRGB(200,60,60),
+        rewardBoxHighlight  = Color3.fromRGB(50,190,80),
+        rewardTextDefault   = Color3.fromRGB(255,255,255),
+        pointer             = Color3.fromRGB(100,180,255),
+        pointerStroke       = Color3.fromRGB(60,130,220),
+        innerStroke         = Color3.fromRGB(180,210,255),
+        cardShadow          = Color3.fromRGB(40,80,140),
+        petNameText         = Color3.fromRGB(30,50,100),
+        toggleBG            = Color3.fromRGB(60,140,255),
+        toggleShadow        = Color3.fromRGB(30,100,200),
+        toggleStroke        = Color3.fromRGB(30,100,200),
+    }
+    ss.TIERS = {
+        HIGH = {
+            "Shadow Dragon","Bat Dragon","Frost Dragon","Giraffe","Owl","Parrot","Crow",
+            "Evil Unicorn","Arctic Reindeer","Hedgehog","Dalmatian",
+        },
+        MID = {
+            "Turtle","Kangaroo","Lion","Elephant","Rhino","Chocolate Chip Bat Dragon",
+            "Cow","Blazing Lion","African Wild Dog","Flamingo","Diamond Butterfly",
+            "Mini Pig","Caterpillar","Albino Monkey","Candyfloss Chick","Pelican",
+            "Blue Dog","Pink Cat","Haetae","Peppermint Penguin","Winged Tiger",
+            "Sugar Glider","Shark Puppy","Goat","Sheeeeep","Lion Cub","Nessie",
+            "Frostbite Bear","Balloon Unicorn","Honey Badger","Hot Doggo","Crocodile",
+            "Hare","Ram","Yeti","Meerkat","Jellyfish","Happy Clam","Orchid Butterfly",
+            "Many Mackerel","Strawberry Shortcake Bat Dragon","Zombie Buffalo","Fairy Bat Dragon",
+        },
+    }
+    ss.PROPERTY_COMBOS = {
+        {flyable=true, rideable=true, neon=false, mega_neon=false, label="FR"},
+        {flyable=true, rideable=true, neon=true,  mega_neon=false, label="NFR"},
+        {flyable=true, rideable=true, neon=false, mega_neon=true,  label="MFR"},
+    }
+
+    ss.resolvePetsForTier = function(tierName)
+        local names = ss.TIERS[tierName]
+        if not names then return {} end
+        local resolved = {}
+        for _, petName in ipairs(names) do
+            local found = false
+            for kind, data in pairs(InventoryDB.pets or {}) do
+                if data.name == petName then
+                    local combo = ss.PROPERTY_COMBOS[math.random(1,#ss.PROPERTY_COMBOS)]
+                    table.insert(resolved, {
+                        name=petName, kind=kind, image=data.image or "",
+                        item_data={
+                            category="pets", kind=kind,
+                            unique="spinner_"..kind.."_"..math.random(1,99999),
+                            properties={flyable=combo.flyable,rideable=combo.rideable,neon=combo.neon,mega_neon=combo.mega_neon},
+                        },
+                        propLabel=combo.label,
+                    })
+                    found=true; break
+                end
+            end
+            if not found then
+                local k = petName:gsub(" ","")
+                table.insert(resolved, {
+                    name=petName, kind=k, image="",
+                    item_data={
+                        category="pets", kind=k, unique="spinner_"..k,
+                        properties={flyable=true,rideable=true,neon=false,mega_neon=true},
+                    },
+                    propLabel="MFR",
+                })
+            end
+        end
+        return resolved
+    end
+
+    ss.PETS         = {}
+    ss.STRIP_REPEATS= 20
+    ss.STRIP_PETS   = {}
+    ss.CARD_GAP     = 6
+    ss.spinning     = false
+    ss.spinCount    = 0
+    ss.persistentHL = -1
+    ss.petCards     = {}
+    ss.cardScales   = {}
+    ss.rewardBoxes  = {}
+    ss.currentTier  = nil
+    ss.dragState    = {dragStart=nil,startPos=nil,dragMoved=false}
+
+    -- Draggable toggle button (floating, same as source)
+    ss.toggleGui = Instance.new("ScreenGui")
+    ss.toggleGui.Name = "PetSpinnerToggle"
+    ss.toggleGui.ResetOnSpawn = false
+    ss.toggleGui.DisplayOrder = 100
+    ss.toggleGui.Parent = PlayerGui
+
+    ss.toggleBtn = Instance.new("TextButton")
+    ss.toggleBtn.Name = "ToggleBtn"
+    ss.toggleBtn.Size = UDim2.new(0,52,0,52)
+    ss.toggleBtn.Position = UDim2.new(0,14,0.5,0)
+    ss.toggleBtn.AnchorPoint = Vector2.new(0,0.5)
+    ss.toggleBtn.BackgroundColor3 = ss.THEME.toggleBG
+    ss.toggleBtn.BorderSizePixel = 0
+    ss.toggleBtn.Text = ""
+    ss.toggleBtn.AutoButtonColor = true
+    ss.toggleBtn.Parent = ss.toggleGui
+    Instance.new("UICorner",ss.toggleBtn).CornerRadius = UDim.new(0,12)
+
+    local toggleShadow = Instance.new("Frame")
+    toggleShadow.Size = UDim2.new(1,2,1,2)
+    toggleShadow.Position = UDim2.new(0.5,0,0.5,3)
+    toggleShadow.AnchorPoint = Vector2.new(0.5,0.5)
+    toggleShadow.BackgroundColor3 = ss.THEME.toggleShadow
+    toggleShadow.BorderSizePixel = 0
+    toggleShadow.ZIndex = 0
+    toggleShadow.Parent = ss.toggleBtn
+    Instance.new("UICorner",toggleShadow).CornerRadius = UDim.new(0,12)
+
+    local tIcon = ss.ItemImageTemplate:Clone()
+    tIcon.Image = "rbxassetid://4115248712"
+    tIcon.Size = UDim2.new(0,34,0,34)
+    tIcon.Position = UDim2.new(0.5,0,0.5,-1)
+    tIcon.AnchorPoint = Vector2.new(0.5,0.5)
+    tIcon.BackgroundTransparency = 1
+    tIcon.ScaleType = Enum.ScaleType.Fit
+    tIcon.ZIndex = 2
+    tIcon.Parent = ss.toggleBtn
+
+    local tStroke = Instance.new("UIStroke")
+    tStroke.Color = ss.THEME.toggleStroke
+    tStroke.Thickness = 2
+    tStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    tStroke.Parent = ss.toggleBtn
+
+    -- Dragging the toggle button
+    ss.toggleBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            ss.dragState.dragMoved = false
+            ss.dragState.dragStart = input.Position
+            ss.dragState.startPos  = ss.toggleBtn.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if ss.dragState.dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - ss.dragState.dragStart
+            if delta.Magnitude > 6 then ss.dragState.dragMoved = true end
+            if ss.dragState.dragMoved then
+                ss.toggleBtn.Position = UDim2.new(
+                    ss.dragState.startPos.X.Scale, ss.dragState.startPos.X.Offset + delta.X,
+                    ss.dragState.startPos.Y.Scale, ss.dragState.startPos.Y.Offset + delta.Y
+                )
+            end
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            ss.dragState.dragStart = nil
+        end
+    end)
+
+    ss.toggleBtn.MouseButton1Click:Connect(function()
+        if ss.dragState.dragMoved then return end
+        if DailyLoginGui.Enabled then
+            DailyLoginGui.Enabled = false
+            MainFrame.Visible = false
+        else
+            ss.showTierPopup()
+        end
+    end)
+
+    -- Set up the DailyLoginApp UI as the spinner
+    DailyLoginGui.Enabled = false
+    MainFrame.Visible = false
+
+    ss.app.claim_ad_button_instance.Visible = false
+    ss.app.milestones_button_instance.Visible = false
+    ss.app.early_claim_explainer_button_instance.Visible = false
+
+    local daysContainer = ss.app.days_list_container
+    daysContainer:FindFirstChild("LeftArrowButtonContainer").Visible  = false
+    daysContainer:FindFirstChild("RightArrowButtonContainer").Visible = false
+    for _, bucket in ipairs(ss.app.day_buckets) do bucket:Destroy() end
+    ss.app.day_buckets = {}
+    if ss.app.page_layout then ss.app.page_layout:Destroy() end
+
+    do
+        local taglineArea = ss.app.body:FindFirstChild("TaglineArea")
+        if taglineArea then
+            taglineArea.Visible = true
+            local tagline = taglineArea:FindFirstChild("Tagline")
+            if tagline then tagline.Text = "Spin to win your dream pet!"; tagline.Font = Enum.Font.GothamBold end
+            for _, child in ipairs(taglineArea:GetChildren()) do
+                if child.Name ~= "Tagline" and not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+                    child.Visible = false
+                end
+            end
+        end
+    end
+
+    ss.spinBtn      = ss.app.claim_depth_button
+    ss.claimBtnInst = ss.app.claim_button_instance
+
+    do
+        local buttonsContainer = ss.app.body:FindFirstChild("Buttons")
+        if buttonsContainer then buttonsContainer.Size = buttonsContainer.Size + UDim2.new(0.5,0,0,0) end
+    end
+    ss.claimBtnInst.Size = ss.claimBtnInst.Size + UDim2.new(0.7,0,0,0)
+    do
+        local face   = ss.claimBtnInst:FindFirstChild("Face")
+        local shadow = ss.claimBtnInst:FindFirstChild("Shadow")
+        if face   then face.Size   = UDim2.new(1,0,face.Size.Y.Scale,face.Size.Y.Offset)   end
+        if shadow then shadow.Size = UDim2.new(1,0,shadow.Size.Y.Scale,shadow.Size.Y.Offset) end
+    end
+    ss.spinBtn:set_state("normal")
+    ss.spinBtn:set_text("SPIN")
+
+    local daysList = ss.app.days_list
+    daysList.ClipsDescendants = true
+    task.wait()
+    local vpH = daysList.AbsoluteSize.Y
+    local vpW = daysList.AbsoluteSize.X
+    local CARD_SIZE   = math.max(math.floor(vpH*0.68),50)
+    local CELL_WIDTH  = CARD_SIZE + ss.CARD_GAP
+    local originalBtnSize = ss.claimBtnInst.Size
+    local MFR_PIP_SIZE    = math.clamp(math.floor(CARD_SIZE*0.17),8,16)
+
+    -- Strip (scrolling row of pet cards)
+    local Strip = Instance.new("Frame")
+    Strip.Name = "Strip"; Strip.Size = UDim2.new(0,100,1,0)
+    Strip.Position = UDim2.new(0,0,0.5,0); Strip.AnchorPoint = Vector2.new(0,0.5)
+    Strip.BackgroundTransparency = 1; Strip.Parent = daysList
+
+    -- Centre pointer
+    local Pointer = Instance.new("Frame")
+    Pointer.Size = UDim2.new(0,3,0.7,0); Pointer.Position = UDim2.new(0.5,0,0.5,0)
+    Pointer.AnchorPoint = Vector2.new(0.5,0.5); Pointer.BackgroundColor3 = ss.THEME.pointer
+    Pointer.BorderSizePixel = 0; Pointer.ZIndex = 10; Pointer.Parent = daysList
+    do
+        local ps = Instance.new("UIStroke")
+        ps.Color = ss.THEME.pointerStroke; ps.Thickness = 1; ps.Transparency = 0.4; ps.Parent = Pointer
+    end
+
+    -- Card helpers
+    local function animateStroke(stroke, color, thickness)
+        TweenService:Create(stroke, TweenInfo.new(0.12,Enum.EasingStyle.Quad),{Color=color,Thickness=thickness}):Play()
+    end
+    local function resetCard(card)
+        local s = card:FindFirstChild("Stroke")
+        if s then animateStroke(s,ss.THEME.cardDefaultStroke,2) end
+        TweenService:Create(card,TweenInfo.new(0.12),{BackgroundColor3=ss.THEME.cardDefaultBG}):Play()
+        local idx = card:GetAttribute("CardIndex")
+        if idx and ss.rewardBoxes[idx] then
+            TweenService:Create(ss.rewardBoxes[idx],TweenInfo.new(0.12),{BackgroundColor3=ss.THEME.rewardBoxDefault}):Play()
+        end
+    end
+    local function highlightCard(card)
+        local s = card:FindFirstChild("Stroke")
+        if s then animateStroke(s,ss.THEME.cardHighlightStroke,3) end
+        TweenService:Create(card,TweenInfo.new(0.08),{BackgroundColor3=ss.THEME.cardHighlightBG}):Play()
+        local idx = card:GetAttribute("CardIndex")
+        if idx and ss.rewardBoxes[idx] then
+            TweenService:Create(ss.rewardBoxes[idx],TweenInfo.new(0.08),{BackgroundColor3=ss.THEME.rewardBoxHighlight}):Play()
+        end
+    end
+
+    -- Build the repeating strip for a tier
+    local function buildStrip(tierName)
+        if ss.currentTier == tierName and #ss.petCards > 0 then return end
+        ss.currentTier = tierName
+        for _, child in ipairs(Strip:GetChildren()) do child:Destroy() end
+        ss.petCards={}; ss.cardScales={}; ss.rewardBoxes={}; ss.persistentHL=-1
+        ss.PETS = ss.resolvePetsForTier(tierName)
+        ss.STRIP_REPEATS = math.clamp(math.floor(300/math.max(#ss.PETS,1)),4,30)
+        local SPIN_SETS  = math.clamp(math.floor(ss.STRIP_REPEATS/4),2,8)
+        ss.SPIN_SETS = SPIN_SETS
+        ss.STRIP_PETS = {}
+        for _ = 1, ss.STRIP_REPEATS do
+            for _, pet in ipairs(ss.PETS) do table.insert(ss.STRIP_PETS,pet) end
+        end
+        Strip.Size = UDim2.new(0,#ss.STRIP_PETS*CELL_WIDTH,1,0)
+        Strip.Position = UDim2.new(0,0,0.5,0)
+        for i, pet in ipairs(ss.STRIP_PETS) do
+            local shadow = Instance.new("Frame")
+            shadow.Name = "Shadow_"..i
+            shadow.Size = UDim2.new(0,CARD_SIZE+4,0,CARD_SIZE+4)
+            shadow.Position = UDim2.new(0,(i-1)*CELL_WIDTH+CARD_SIZE/2,0.5,2)
+            shadow.AnchorPoint = Vector2.new(0.5,0.5)
+            shadow.BackgroundColor3 = ss.THEME.cardShadow
+            shadow.BackgroundTransparency = 0.82; shadow.BorderSizePixel = 0; shadow.ZIndex = 0
+            shadow.Parent = Strip
+            Instance.new("UICorner",shadow).CornerRadius = UDim.new(0,12)
+
+            local card = Instance.new("Frame")
+            card.Name = "Card_"..i
+            card.Size = UDim2.new(0,CARD_SIZE,0,CARD_SIZE)
+            card.Position = UDim2.new(0,(i-1)*CELL_WIDTH,0.5,0)
+            card.AnchorPoint = Vector2.new(0,0.5)
+            card.BackgroundColor3 = ss.THEME.cardDefaultBG
+            card.BorderSizePixel = 0; card.ZIndex = 1
+            card:SetAttribute("CardIndex",i)
+            Instance.new("UICorner",card).CornerRadius = UDim.new(0,10)
+
+            local uiScale = Instance.new("UIScale"); uiScale.Scale = 1; uiScale.Parent = card
+            ss.cardScales[i] = uiScale
+
+            local stroke = Instance.new("UIStroke")
+            stroke.Name = "Stroke"; stroke.Color = ss.THEME.cardDefaultStroke
+            stroke.Thickness = 2; stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; stroke.Parent = card
+
+            local innerBorder = Instance.new("Frame")
+            innerBorder.Size = UDim2.new(1,-4,1,-4); innerBorder.Position = UDim2.new(0.5,0,0.5,0)
+            innerBorder.AnchorPoint = Vector2.new(0.5,0.5); innerBorder.BackgroundTransparency = 1; innerBorder.Parent = card
+            Instance.new("UICorner",innerBorder).CornerRadius = UDim.new(0,8)
+            local innerStroke = Instance.new("UIStroke")
+            innerStroke.Color = ss.THEME.innerStroke; innerStroke.Thickness = 1
+            innerStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; innerStroke.Parent = innerBorder
+
+            local content = Instance.new("Frame")
+            content.Size = UDim2.new(1,-8,1,-8); content.Position = UDim2.new(0.5,0,0.5,0)
+            content.AnchorPoint = Vector2.new(0.5,0.5); content.BackgroundTransparency = 1; content.Parent = card
+
+            local rewardBox = Instance.new("Frame")
+            rewardBox.Name = "RewardBox"; rewardBox.Size = UDim2.new(0.55,0,0.11,0)
+            rewardBox.Position = UDim2.new(0.5,0,0,0); rewardBox.AnchorPoint = Vector2.new(0.5,0)
+            rewardBox.BackgroundColor3 = ss.THEME.rewardBoxDefault
+            rewardBox.BorderSizePixel = 0; rewardBox.ZIndex = 5; rewardBox.Parent = content
+            Instance.new("UICorner",rewardBox).CornerRadius = UDim.new(0,6)
+            local rwStroke = Instance.new("UIStroke")
+            rwStroke.Color = Color3.fromRGB(160,40,40); rwStroke.Thickness = 1.5
+            rwStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; rwStroke.Parent = rewardBox
+            local rwText = Instance.new("TextLabel")
+            rwText.Size = UDim2.new(1,0,1,0); rwText.BackgroundTransparency = 1
+            rwText.Font = Enum.Font.GothamBold; rwText.TextScaled = true
+            rwText.TextColor3 = ss.THEME.rewardTextDefault; rwText.Text = "REWARD"
+            rwText.ZIndex = 6; rwText.Parent = rewardBox
+            ss.rewardBoxes[i] = rewardBox
+
+            local img = ss.ItemImageTemplate:Clone()
+            img.Image = pet.image or ""
+            img.Size = UDim2.new(1,0,0.52,0); img.Position = UDim2.new(0.5,0,0.12,0)
+            img.AnchorPoint = Vector2.new(0.5,0); img.ScaleType = Enum.ScaleType.Fit
+            img.BackgroundTransparency = 1; img.ZIndex = 1; img.Parent = content
+
+            local tagHolder = Instance.new("Frame")
+            tagHolder.Name = "TagHolder"; tagHolder.Size = UDim2.new(1,0,0.18,0)
+            tagHolder.Position = UDim2.new(0.5,0,0.65,0); tagHolder.AnchorPoint = Vector2.new(0.5,0)
+            tagHolder.BackgroundTransparency = 1; tagHolder.ZIndex = 1; tagHolder.Parent = content
+            pcall(function()
+                UIManager.wrap(tagHolder,"ItemDataTagDisplay"):start({
+                    item_data=pet.item_data, wearing=false, fixed_property_size=MFR_PIP_SIZE,
+                })
+            end)
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Text = pet.name; nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.TextScaled = true; nameLabel.TextColor3 = ss.THEME.petNameText
+            nameLabel.Size = UDim2.new(1,0,0.16,0); nameLabel.Position = UDim2.new(0.5,0,1,0)
+            nameLabel.AnchorPoint = Vector2.new(0.5,1); nameLabel.BackgroundTransparency = 1
+            nameLabel.TextTruncate = Enum.TextTruncate.AtEnd; nameLabel.ZIndex = 1; nameLabel.Parent = content
+
+            card.Parent = Strip
+            ss.petCards[i] = card
+        end
+    end
+
+    -- Card scale update on heartbeat
+    local function updateCardScales()
+        local center = daysList.AbsolutePosition.X + vpW/2
+        for idx, card in ipairs(ss.petCards) do
+            local cardCenter = card.AbsolutePosition.X + CARD_SIZE/2
+            local dist = math.abs(cardCenter - center)
+            local t = math.clamp(dist/(vpW/2),0,1)
+            local sc = ss.cardScales[idx]
+            if sc then sc.Scale = 1.12 - t*0.24 end
+        end
+    end
+
+    RunService.Heartbeat:Connect(function()
+        updateCardScales()
+        local center = daysList.AbsolutePosition.X + vpW/2
+        for idx, card in ipairs(ss.petCards) do
+            local cc = card.AbsolutePosition.X + CARD_SIZE/2
+            if math.abs(cc-center) < CARD_SIZE/2 then
+                if idx ~= ss.persistentHL then
+                    if ss.persistentHL > 0 and ss.petCards[ss.persistentHL] then
+                        resetCard(ss.petCards[ss.persistentHL])
+                    end
+                    highlightCard(card)
+                    ss.persistentHL = idx
+                end
+                break
+            end
+        end
+    end)
+
+    -- Add won pet to the LOCAL player's side of the trade
+    local function addPetToMySide(petName, flags)
+        local TradeAppLocal = UIManager.apps.TradeApp
+        if not TradeAppLocal then return end
+        local state = TradeAppLocal:_get_local_trade_state()
+        if not state then return end
+        local myOffer = (state.sender == Players.LocalPlayer) and state.sender_offer or state.recipient_offer
+        if not myOffer or #myOffer.items >= 18 then return end
+        for catName, catTable in pairs(InventoryDB) do
+            if catName == "pets" then
+                for id, item in pairs(catTable) do
+                    if item.name == petName then
+                        local petItem = {
+                            category="pets", kind=id,
+                            unique=HttpService:GenerateGUID(),
+                            properties={flyable=flags.F,rideable=flags.R,neon=flags.N,mega_neon=flags.M,age=1},
+                        }
+                        table.insert(myOffer.items, petItem)
+                        state.sender_offer.negotiated   = false
+                        state.recipient_offer.negotiated= false
+                        if state.current_stage == "confirmation" then
+                            state.current_stage = "negotiation"
+                            state.sender_offer.confirmed   = false
+                            state.recipient_offer.confirmed= false
+                        end
+                        state.offer_version = state.offer_version + 1
+                        TradeAppLocal:_overwrite_local_trade_state(state)
+                        pcall(function() TradeAppLocal:_lock_trade_for_appropriate_time() end)
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    -- Show win popup, then add pet to trade offer
+    local lastWonPet = nil
+    local function showWinPopup(pet)
+        lastWonPet = pet
+        task.spawn(function()
+            local props = pet.item_data and pet.item_data.properties or {}
+            local petKind = pet.kind
+            DialogApp:dialog({
+                dialog_type = "ItemPreviewDialog",
+                item = {
+                    unique   = HttpService:GenerateGUID(false),
+                    category = "pets", id=petKind, kind=petKind,
+                    properties = {
+                        neon=props.neon or false, mega_neon=props.mega_neon or false,
+                        rideable=props.rideable or false, flyable=props.flyable or false,
+                    },
+                },
+                text   = ("You won a %s!"):format(pet.name),
+                button = "Add to Trade",
+            })
+            if lastWonPet then
+                addPetToMySide(pet.name, {
+                    F=props.flyable or false, R=props.rideable or false,
+                    N=props.neon or false,    M=props.mega_neon or false,
+                })
+            end
+        end)
+    end
+
+    -- Main spin function
+    local function doSpin()
+        if ss.spinning then return end
+        ss.spinning = true
+        ss.spinCount = ss.spinCount + 1
+        ss.spinBtn:set_state("inactive")
+        ss.spinBtn:set_text("SPINNING...")
+        TweenService:Create(ss.claimBtnInst,TweenInfo.new(0.15,Enum.EasingStyle.Quad),{
+            Size = originalBtnSize - UDim2.new(0.03,0,0,2)
+        }):Play()
+        for _, card in ipairs(ss.petCards) do resetCard(card) end
+        ss.persistentHL = -1
+        local winIndex = math.random(1,#ss.PETS)
+        local curX     = Strip.Position.X.Offset
+        local halfStrip = (#ss.STRIP_PETS/2)*CELL_WIDTH
+        if -curX > halfStrip then
+            local jumpBack = math.floor(ss.STRIP_REPEATS/2)*#ss.PETS*CELL_WIDTH
+            Strip.Position = UDim2.new(0,curX+jumpBack,0.5,0)
+            curX = Strip.Position.X.Offset
+        end
+        local currentCenter = math.clamp(math.floor((-curX+vpW/2)/CELL_WIDTH)+1,1,#ss.STRIP_PETS)
+        local targetIdx     = math.clamp(currentCenter+((ss.SPIN_SETS or 3)*#ss.PETS)+(winIndex-1),1,#ss.STRIP_PETS)
+        local targetX       = -((targetIdx-1)*CELL_WIDTH)+vpW/2-(CARD_SIZE/2)
+        local spinTween = TweenService:Create(Strip,TweenInfo.new(4,Enum.EasingStyle.Quint,Enum.EasingDirection.InOut),{
+            Position=UDim2.new(0,targetX,0.5,0)
+        })
+        spinTween:Play()
+        spinTween.Completed:Connect(function()
+            local winCard = ss.petCards[targetIdx]
+            local winPet  = ss.STRIP_PETS[targetIdx]
+            if winCard then
+                local s = winCard:FindFirstChild("Stroke")
+                for _ = 1,3 do
+                    if s then animateStroke(s,ss.THEME.cardWinFlashStroke,3.5) end
+                    TweenService:Create(winCard,TweenInfo.new(0.08),{BackgroundColor3=ss.THEME.cardWinFlashBG}):Play()
+                    task.wait(0.12); highlightCard(winCard); task.wait(0.12)
+                end
+            end
+            pcall(function() if ss.SoundPlayer then ss.SoundPlayer.FX:play("GoldSparklePrize") end end)
+            task.wait(0.3)
+            DailyLoginGui.Enabled = false; MainFrame.Visible = false
+            if winPet then showWinPopup(winPet) end
+            ss.spinBtn:set_state("normal"); ss.spinBtn:set_text("SPIN")
+            ss.spinning = false
+        end)
+    end
+
+    ss.spinBtn:set_mouse_button1_click(doSpin)
+
+    local function selectTier(tierName)
+        buildStrip(tierName)
+        DailyLoginGui.Enabled = true; MainFrame.Visible = true
+        ss.spinBtn:set_state("normal"); ss.spinBtn:set_text("SPIN")
+    end
+
+    local function showTierPopup()
+        task.spawn(function()
+            local response = DialogApp:dialog({
+                text  = "Which tier would you like to spin?",
+                left  = "High Tier",
+                right = "Mid Tier",
+            })
+            if response == "High Tier" then selectTier("HIGH")
+            elseif response == "Mid Tier" then selectTier("MID") end
+        end)
+    end
+    ss.showTierPopup = showTierPopup
+
+    -- Expose to Spawn tab button
+    _G._ShowSpinWheel = showTierPopup
+end)
